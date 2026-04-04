@@ -1,0 +1,171 @@
+{% extends "base.html" %}
+{% block title %}Firewalls — Mikrotik Whitelist Service{% endblock %}
+{% block content %}
+<div class="d-flex align-items-center justify-content-between mb-3">
+  <h4 class="mb-0"><i class="bi bi-hdd-network me-2"></i>Firewalls</h4>
+  <div class="d-flex gap-2">
+    <button class="btn btn-outline-secondary btn-sm" onclick="triggerApplyAll(this)">
+      <i class="bi bi-send me-1"></i>Apply All
+    </button>
+    <button class="btn btn-primary btn-sm" data-bs-toggle="modal" data-bs-target="#addFwModal">
+      <i class="bi bi-plus-lg me-1"></i>Add New
+    </button>
+  </div>
+</div>
+
+<div class="table-responsive">
+<table class="table table-hover table-bordered bg-white shadow-sm rounded">
+  <thead class="table-dark">
+    <tr>
+      <th>ID</th>
+      <th>Address</th>
+      <th>Port</th>
+      <th>User</th>
+      <th>Secret</th>
+      <th>Type</th>
+      <th>Apply Freq (h)</th>
+      <th>Inactive</th>
+      <th>Created</th>
+      <th>Updated</th>
+      <th>Last Apply</th>
+      <th>Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for fw in firewalls %}
+  <tr>
+    <form method="post" action="/firewalls/{{ fw.id }}/save">
+    <td class="text-muted small">{{ fw.id }}</td>
+    <td><input name="firewallAddress" class="form-control form-control-sm" value="{{ fw.firewallAddress }}" required></td>
+    <td><input name="firewallPort" type="number" class="form-control form-control-sm" value="{{ fw.firewallPort }}" style="width:75px"></td>
+    <td><input name="firewallUser" class="form-control form-control-sm" value="{{ fw.firewallUser }}" required></td>
+    <td>
+      <input name="firewallSecret" type="password" class="form-control form-control-sm"
+             placeholder="(leave blank to keep)" autocomplete="new-password">
+    </td>
+    <td>
+      <select name="firewallTypeId" class="form-select form-select-sm">
+        {% for t in fw_types %}
+        <option value="{{ t.id }}" {% if t.id == fw.firewallTypeId %}selected{% endif %}>
+          {{ t.firewallTypeDescription }}
+        </option>
+        {% endfor %}
+      </select>
+    </td>
+    <td><input name="applyFrequencyHours" type="number" min="0" class="form-control form-control-sm" value="{{ fw.applyFrequencyHours }}" style="width:70px"></td>
+    <td class="text-center">
+      <input name="flagInactive" type="checkbox" class="form-check-input" value="1"
+             {% if fw.flagInactive == 1 %}checked{% endif %}>
+    </td>
+    <td class="small text-muted">{{ fw.createDate.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+    <td class="small text-muted">{{ fw.updateDate.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+    <td>
+      {% set ap = last_applies.get(fw.id) %}
+      {% if ap %}
+        <span class="badge status-badge
+          {% if ap.status == 'complete' %}bg-success
+          {% elif ap.status == 'failed' %}bg-danger
+          {% elif ap.status in ['generating','pushing'] %}bg-warning text-dark
+          {% else %}bg-secondary{% endif %}">
+          {{ ap.status }}
+        </span>
+        <div class="small text-muted">{{ ap.startedAt.strftime('%Y-%m-%d %H:%M:%S') if ap.startedAt else '' }}</div>
+      {% else %}<span class="text-muted small">—</span>{% endif %}
+    </td>
+    <td>
+      <div class="d-flex gap-1">
+        <button type="submit" class="btn btn-sm btn-outline-primary" title="Save">
+          <i class="bi bi-floppy"></i>
+        </button>
+    </form>
+        <button class="btn btn-sm btn-outline-secondary" title="Apply Now"
+                onclick="triggerApply({{ fw.id }}, this)">
+          <i class="bi bi-send"></i>
+        </button>
+        <form method="post" action="/firewalls/{{ fw.id }}/delete"
+              onsubmit="return confirm('Delete firewall {{ fw.firewallAddress }}?')">
+          <button type="submit" class="btn btn-sm btn-outline-danger" title="Delete">
+            <i class="bi bi-trash"></i>
+          </button>
+        </form>
+      </div>
+    </td>
+  </tr>
+  {% else %}
+  <tr><td colspan="12" class="text-center text-muted py-3">No firewalls configured yet.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+
+<!-- Add New Modal -->
+<div class="modal fade" id="addFwModal" tabindex="-1">
+  <div class="modal-dialog modal-lg">
+    <form method="post" action="/firewalls/new">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Add New Firewall</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body row g-3">
+        <div class="col-md-8">
+          <label class="form-label">Address <span class="text-danger">*</span></label>
+          <input name="firewallAddress" class="form-control" required placeholder="192.168.1.1 or router.local">
+        </div>
+        <div class="col-md-4">
+          <label class="form-label">SSH Port</label>
+          <input name="firewallPort" type="number" class="form-control" value="22">
+        </div>
+        <div class="col-md-6">
+          <label class="form-label">Username <span class="text-danger">*</span></label>
+          <input name="firewallUser" class="form-control" required>
+        </div>
+        <div class="col-md-6">
+          <label class="form-label">Password / Secret <span class="text-danger">*</span></label>
+          <input name="firewallSecret" type="password" class="form-control" required autocomplete="new-password">
+        </div>
+        <div class="col-md-6">
+          <label class="form-label">Firewall Type <span class="text-danger">*</span></label>
+          <select name="firewallTypeId" class="form-select" required>
+            {% for t in fw_types %}
+            <option value="{{ t.id }}">{{ t.firewallTypeDescription }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="col-md-4">
+          <label class="form-label">Apply Frequency (hours)</label>
+          <input name="applyFrequencyHours" type="number" min="0" class="form-control" value="0">
+          <div class="form-text">0 = manual only</div>
+        </div>
+        <div class="col-md-2 d-flex align-items-end">
+          <div class="form-check">
+            <input name="flagInactive" type="checkbox" class="form-check-input" value="1" id="newFwInactive">
+            <label class="form-check-label" for="newFwInactive">Inactive</label>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="submit" class="btn btn-primary">Add Firewall</button>
+      </div>
+    </div>
+    </form>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function triggerApply(id, btn) {
+  btn.disabled = true;
+  fetch(`/internal/apply/${id}`, {method: 'POST'})
+    .finally(() => { btn.disabled = false; });
+}
+function triggerApplyAll(btn) {
+  btn.disabled = true;
+  btn.innerHTML = '<i class="bi bi-hourglass-split me-1"></i>Applying…';
+  fetch('/internal/apply/all', {method: 'POST'})
+    .finally(() => { btn.disabled = false; btn.innerHTML = '<i class="bi bi-send me-1"></i>Apply All'; });
+}
+</script>
+{% endblock %}

@@ -1,0 +1,138 @@
+{% extends "base.html" %}
+{% block title %}Status & Logs — Mikrotik Whitelist Service{% endblock %}
+{% block content %}
+<h4 class="mb-4"><i class="bi bi-activity me-2"></i>Status &amp; Logs</h4>
+
+<!-- ── Fetch Jobs ──────────────────────────────────────────────────────────── -->
+<div class="card mb-4">
+  <div class="card-header fw-semibold d-flex justify-content-between align-items-center">
+    <span><i class="bi bi-cloud-download me-2"></i>Fetch Jobs (last 100)</span>
+    <form method="get" action="/status" class="d-flex gap-2">
+      <select name="iplist_filter" class="form-select form-select-sm" style="width:auto">
+        <option value="">All lists</option>
+        {% for il in iplists %}
+        <option value="{{ il.id }}" {% if iplist_filter == il.id %}selected{% endif %}>
+          #{{ il.id }} {{ il.description or '' }}
+        </option>
+        {% endfor %}
+      </select>
+      <select name="fetch_status_filter" class="form-select form-select-sm" style="width:auto">
+        <option value="">All statuses</option>
+        {% for s in ['pending','fetching','parsing','loading','complete','failed'] %}
+        <option value="{{ s }}" {% if fetch_status_filter == s %}selected{% endif %}>{{ s }}</option>
+        {% endfor %}
+      </select>
+      <!-- preserve apply filter params -->
+      {% if fw_filter %}<input type="hidden" name="fw_filter" value="{{ fw_filter }}">{% endif %}
+      {% if apply_status_filter %}<input type="hidden" name="apply_status_filter" value="{{ apply_status_filter }}">{% endif %}
+      <button type="submit" class="btn btn-sm btn-outline-secondary">Filter</button>
+      <a href="/status" class="btn btn-sm btn-outline-secondary">Reset</a>
+    </form>
+  </div>
+  <div class="card-body p-0">
+    <div class="table-responsive">
+    <table class="table table-sm table-hover mb-0">
+      <thead class="table-light">
+        <tr>
+          <th>Job ID</th><th>List ID</th><th>Status</th>
+          <th>Started</th><th>Completed</th>
+          <th>Parsed</th><th>Loaded</th><th>Error</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for j in fetch_jobs %}
+      <tr>
+        <td class="text-muted small">{{ j.id }}</td>
+        <td>{{ j.iplistsId }}</td>
+        <td>
+          <span class="badge status-badge
+            {% if j.status == 'complete' %}bg-success
+            {% elif j.status == 'failed' %}bg-danger
+            {% elif j.status in ['fetching','parsing','loading'] %}bg-warning text-dark
+            {% else %}bg-secondary{% endif %}">{{ j.status }}</span>
+        </td>
+        <td class="small">{{ j.startedAt.strftime('%Y-%m-%d %H:%M:%S') if j.startedAt else '—' }}</td>
+        <td class="small">{{ j.completedAt.strftime('%Y-%m-%d %H:%M:%S') if j.completedAt else '—' }}</td>
+        <td>{{ j.entriesParsed if j.entriesParsed is not none else '—' }}</td>
+        <td>{{ j.entriesLoaded if j.entriesLoaded is not none else '—' }}</td>
+        <td class="small text-danger">
+          {% if j.errorMessage %}
+          <span title="{{ j.errorMessage }}">{{ j.errorMessage[:80] }}{% if j.errorMessage|length > 80 %}…{% endif %}</span>
+          {% else %}—{% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="8" class="text-center text-muted py-2">No fetch jobs yet.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </div>
+</div>
+
+<!-- ── Apply History ───────────────────────────────────────────────────────── -->
+<div class="card">
+  <div class="card-header fw-semibold d-flex justify-content-between align-items-center">
+    <span><i class="bi bi-send me-2"></i>Apply History (last 100)</span>
+    <form method="get" action="/status" class="d-flex gap-2">
+      <select name="fw_filter" class="form-select form-select-sm" style="width:auto">
+        <option value="">All firewalls</option>
+        {% for fw in firewalls %}
+        <option value="{{ fw.id }}" {% if fw_filter == fw.id %}selected{% endif %}>
+          #{{ fw.id }} {{ fw.firewallAddress }}
+        </option>
+        {% endfor %}
+      </select>
+      <select name="apply_status_filter" class="form-select form-select-sm" style="width:auto">
+        <option value="">All statuses</option>
+        {% for s in ['pending','generating','pushing','complete','failed'] %}
+        <option value="{{ s }}" {% if apply_status_filter == s %}selected{% endif %}>{{ s }}</option>
+        {% endfor %}
+      </select>
+      {% if iplist_filter %}<input type="hidden" name="iplist_filter" value="{{ iplist_filter }}">{% endif %}
+      {% if fetch_status_filter %}<input type="hidden" name="fetch_status_filter" value="{{ fetch_status_filter }}">{% endif %}
+      <button type="submit" class="btn btn-sm btn-outline-secondary">Filter</button>
+      <a href="/status" class="btn btn-sm btn-outline-secondary">Reset</a>
+    </form>
+  </div>
+  <div class="card-body p-0">
+    <div class="table-responsive">
+    <table class="table table-sm table-hover mb-0">
+      <thead class="table-light">
+        <tr>
+          <th>Apply ID</th><th>Firewall ID</th><th>Status</th>
+          <th>Started</th><th>Completed</th>
+          <th>WL Count</th><th>BL Count</th><th>Error</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for a in apply_history %}
+      <tr>
+        <td class="text-muted small">{{ a.id }}</td>
+        <td>{{ a.firewallsId }}</td>
+        <td>
+          <span class="badge status-badge
+            {% if a.status == 'complete' %}bg-success
+            {% elif a.status == 'failed' %}bg-danger
+            {% elif a.status in ['generating','pushing'] %}bg-warning text-dark
+            {% else %}bg-secondary{% endif %}">{{ a.status }}</span>
+        </td>
+        <td class="small">{{ a.startedAt.strftime('%Y-%m-%d %H:%M:%S') if a.startedAt else '—' }}</td>
+        <td class="small">{{ a.completedAt.strftime('%Y-%m-%d %H:%M:%S') if a.completedAt else '—' }}</td>
+        <td>{{ a.whitelistCount if a.whitelistCount is not none else '—' }}</td>
+        <td>{{ a.blacklistCount if a.blacklistCount is not none else '—' }}</td>
+        <td class="small text-danger">
+          {% if a.errorMessage %}
+          <span title="{{ a.errorMessage }}">{{ a.errorMessage[:80] }}{% if a.errorMessage|length > 80 %}…{% endif %}</span>
+          {% else %}—{% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="8" class="text-center text-muted py-2">No apply history yet.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </div>
+</div>
+{% endblock %}

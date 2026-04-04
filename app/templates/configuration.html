@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+{% block title %}Configuration — Mikrotik Whitelist Service{% endblock %}
+{% block content %}
+<h4 class="mb-4"><i class="bi bi-gear me-2"></i>Configuration</h4>
+
+{% if request.query_params.get('saved') %}
+<div class="alert alert-success alert-dismissible fade show" role="alert">
+  Settings saved. <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+</div>
+{% endif %}
+
+<form method="post" action="/configuration">
+  <!-- ── Fetcher ──────────────────────────────────────────────────────────── -->
+  <div class="card mb-4">
+    <div class="card-header fw-semibold"><i class="bi bi-cloud-download me-2"></i>Fetcher Service</div>
+    <div class="card-body">
+      <div class="row align-items-center mb-3">
+        <label class="col-sm-3 col-form-label">Auto-fetch enabled</label>
+        <div class="col-sm-9">
+          <div class="form-check form-switch">
+            <input class="form-check-input" type="checkbox" role="switch"
+                   id="fetcherEnabled" name="fetcherEnabled" value="1"
+                   {% if fetcherEnabled == '1' %}checked{% endif %}>
+            <label class="form-check-label" for="fetcherEnabled">
+              On — fetches each list based on its configured frequency
+            </label>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-footer d-flex gap-2">
+      <button type="submit" class="btn btn-primary btn-sm">Save</button>
+      <button type="button" class="btn btn-outline-secondary btn-sm"
+              hx-post="/internal/fetch/all" onclick="triggerAction(this,'Fetching all lists…')">
+        <i class="bi bi-arrow-clockwise me-1"></i>Fetch Now
+      </button>
+    </div>
+  </div>
+
+  <!-- ── Applicator ─────────────────────────────────────────────────────── -->
+  <div class="card mb-4">
+    <div class="card-header fw-semibold"><i class="bi bi-send me-2"></i>Firewall Applicator Service</div>
+    <div class="card-body">
+      <div class="row align-items-center mb-3">
+        <label class="col-sm-3 col-form-label">Auto-apply enabled</label>
+        <div class="col-sm-9">
+          <div class="form-check form-switch">
+            <input class="form-check-input" type="checkbox" role="switch"
+                   id="applicatorEnabled" name="applicatorEnabled" value="1"
+                   {% if applicatorEnabled == '1' %}checked{% endif %}>
+            <label class="form-check-label" for="applicatorEnabled">
+              On — pushes address lists to each firewall on its configured schedule
+            </label>
+          </div>
+        </div>
+      </div>
+      <div class="row align-items-center">
+        <label class="col-sm-3 col-form-label" for="applicatorTTLDays">TTL (days)</label>
+        <div class="col-sm-3">
+          <input type="number" class="form-control" id="applicatorTTLDays"
+                 name="applicatorTTLDays" min="1" value="{{ applicatorTTLDays or 7 }}">
+          <div class="form-text">How long MikroTik keeps the dynamic address-list entries in memory.</div>
+        </div>
+      </div>
+    </div>
+    <div class="card-footer d-flex gap-2">
+      <button type="submit" class="btn btn-primary btn-sm">Save</button>
+      <button type="button" class="btn btn-outline-secondary btn-sm"
+              onclick="triggerAction(this,'Applying to all firewalls…')">
+        <i class="bi bi-send me-1"></i>Apply Now
+      </button>
+    </div>
+  </div>
+</form>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function triggerAction(btn, msg) {
+  const url = btn.dataset.url || (btn.textContent.includes('Fetch') ? '/internal/fetch/all' : '/internal/apply/all');
+  btn.disabled = true;
+  btn.textContent = msg;
+  fetch(url, {method: 'POST'})
+    .finally(() => { btn.disabled = false; btn.innerHTML = btn.dataset.label || btn.textContent; });
+}
+// Store original labels
+document.querySelectorAll('[onclick^="triggerAction"]').forEach(b => b.dataset.label = b.innerHTML);
+</script>
+{% endblock %}
