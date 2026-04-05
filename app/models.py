@@ -53,7 +53,8 @@ class IpList(_StandardMixin, Base):
         {"schema": SCHEMA},
     )
 
-    url = Column(Text, nullable=False)
+    url = Column(Text, nullable=True)
+    flagUserDefined = Column(SmallInteger, nullable=False, default=0)
     flagBlacklist = Column(SmallInteger, nullable=False, default=0)
     description = Column(Text, nullable=True)
     comment = Column(Text, nullable=True)

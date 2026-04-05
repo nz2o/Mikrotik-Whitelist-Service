@@ -1,5 +1,7 @@
 """UI router — serves all HTML pages."""
 
+import ipaddress
+
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
@@ -14,6 +16,7 @@ from app.models import (
     FetchJob,
     Firewall,
     FirewallType,
+    IpAddress,
     IpList,
 )
 
@@ -36,6 +39,20 @@ def _set_config(db: Session, key: str, value: str) -> None:
     if row:
         row.configurationItemValue = value
         db.commit()
+
+
+def _normalize_ipv4_cidr(value: str) -> str:
+    network = ipaddress.IPv4Network(value.strip(), strict=False)
+    return str(network)
+
+
+def _get_manual_list_or_404(db: Session, iplist_id: int) -> IpList:
+    row = db.query(IpList).filter(IpList.id == iplist_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="IP list not found")
+    if row.flagUserDefined != 1:
+        raise HTTPException(status_code=400, detail="Only user-defined lists can be edited manually")
+    return row
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +117,8 @@ def page_iplists(request: Request, db: Session = Depends(get_db)):
 
 @router.post("/iplists/new")
 def create_iplist(
-    url: str = Form(...),
+    url: str = Form(""),
+    flagUserDefined: int = Form(0),
     flagBlacklist: int = Form(0),
     description: str = Form(""),
     comment: str = Form(""),
@@ -108,28 +126,35 @@ def create_iplist(
     flagInactive: int = Form(0),
     db: Session = Depends(get_db),
 ):
+    normalized_url = (url or "").strip() or None
+    if flagUserDefined != 1 and not normalized_url:
+        raise HTTPException(status_code=400, detail="URL is required for downloaded lists")
     row = IpList(
-        url=url,
+        url=normalized_url,
+        flagUserDefined=flagUserDefined,
         flagBlacklist=flagBlacklist,
         description=description or None,
         comment=comment or None,
-        fetchFrequencyHours=fetchFrequencyHours,
+        fetchFrequencyHours=0 if flagUserDefined == 1 else fetchFrequencyHours,
         flagInactive=flagInactive,
     )
     db.add(row)
     db.commit()
     db.refresh(row)
-    # Trigger initial fetch in background
-    import threading
-    from app.services import fetcher as fetcher_svc
-    threading.Thread(target=fetcher_svc.fetch_list, args=[row.id], daemon=True).start()
+    if row.flagUserDefined != 1:
+        # Trigger initial fetch in background for downloaded lists only
+        import threading
+        from app.services import fetcher as fetcher_svc
+
+        threading.Thread(target=fetcher_svc.fetch_list, args=[row.id], daemon=True).start()
     return RedirectResponse("/iplists", status_code=303)
 
 
 @router.post("/iplists/{iplist_id}/save")
 def save_iplist(
     iplist_id: int,
-    url: str = Form(...),
+    url: str = Form(""),
+    flagUserDefined: int = Form(0),
     flagBlacklist: int = Form(0),
     description: str = Form(""),
     comment: str = Form(""),
@@ -140,11 +165,15 @@ def save_iplist(
     row = db.query(IpList).filter(IpList.id == iplist_id).first()
     if not row:
         raise HTTPException(status_code=404, detail="Not found")
-    row.url = url
+    normalized_url = (url or "").strip() or None
+    if flagUserDefined != 1 and not normalized_url:
+        raise HTTPException(status_code=400, detail="URL is required for downloaded lists")
+    row.url = normalized_url
+    row.flagUserDefined = flagUserDefined
     row.flagBlacklist = flagBlacklist
     row.description = description or None
     row.comment = comment or None
-    row.fetchFrequencyHours = fetchFrequencyHours
+    row.fetchFrequencyHours = 0 if flagUserDefined == 1 else fetchFrequencyHours
     row.flagInactive = flagInactive
     db.commit()
     return RedirectResponse("/iplists", status_code=303)
@@ -158,6 +187,79 @@ def delete_iplist(iplist_id: int, db: Session = Depends(get_db)):
     db.delete(row)
     db.commit()
     return RedirectResponse("/iplists", status_code=303)
+
+
+@router.get("/iplists/{iplist_id}/addresses", response_class=HTMLResponse)
+def page_ipaddresses(iplist_id: int, request: Request, db: Session = Depends(get_db)):
+    iplist = _get_manual_list_or_404(db, iplist_id)
+    addresses = (
+        db.query(IpAddress)
+        .filter(IpAddress.iplistsId == iplist_id)
+        .order_by(IpAddress.id)
+        .all()
+    )
+    return templates.TemplateResponse(
+        request,
+        "ipaddresses.html",
+        {"iplist": iplist, "addresses": addresses},
+    )
+
+
+@router.post("/iplists/{iplist_id}/addresses/new")
+def create_ipaddress(
+    iplist_id: int,
+    ipAddress: str = Form(...),
+    comment: str = Form(""),
+    flagInactive: int = Form(0),
+    db: Session = Depends(get_db),
+):
+    _get_manual_list_or_404(db, iplist_id)
+    normalized = _normalize_ipv4_cidr(ipAddress)
+    row = IpAddress(
+        ipAddress=normalized,
+        iplistsId=iplist_id,
+        flagInactive=flagInactive,
+    )
+    db.add(row)
+    db.commit()
+    return RedirectResponse(f"/iplists/{iplist_id}/addresses", status_code=303)
+
+
+@router.post("/iplists/{iplist_id}/addresses/{address_id}/save")
+def save_ipaddress(
+    iplist_id: int,
+    address_id: int,
+    ipAddress: str = Form(...),
+    flagInactive: int = Form(0),
+    db: Session = Depends(get_db),
+):
+    _get_manual_list_or_404(db, iplist_id)
+    row = (
+        db.query(IpAddress)
+        .filter(IpAddress.id == address_id, IpAddress.iplistsId == iplist_id)
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="IP address entry not found")
+    row.ipAddress = _normalize_ipv4_cidr(ipAddress)
+    row.flagInactive = flagInactive
+    db.commit()
+    return RedirectResponse(f"/iplists/{iplist_id}/addresses", status_code=303)
+
+
+@router.post("/iplists/{iplist_id}/addresses/{address_id}/delete")
+def delete_ipaddress(iplist_id: int, address_id: int, db: Session = Depends(get_db)):
+    _get_manual_list_or_404(db, iplist_id)
+    row = (
+        db.query(IpAddress)
+        .filter(IpAddress.id == address_id, IpAddress.iplistsId == iplist_id)
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="IP address entry not found")
+    db.delete(row)
+    db.commit()
+    return RedirectResponse(f"/iplists/{iplist_id}/addresses", status_code=303)
 
 
 # ---------------------------------------------------------------------------

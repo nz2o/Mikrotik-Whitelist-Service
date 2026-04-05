@@ -76,6 +76,12 @@ def fetch_list(iplist_id: int) -> None:
         if iplist.flagInactive == 1:
             log.info("Skipping inactive iplist", extra={"iplistsId": iplist_id})
             return
+        if iplist.flagUserDefined == 1:
+            log.info("Skipping user-defined iplist", extra={"iplistsId": iplist_id})
+            return
+        if not iplist.url:
+            log.info("Skipping iplist with no URL", extra={"iplistsId": iplist_id})
+            return
 
         # Create fetchJob record
         job = FetchJob(
@@ -163,7 +169,7 @@ def fetch_all() -> None:
         ids = [
             row.id
             for row in db.query(IpList.id)
-            .filter(IpList.flagInactive == 0)
+            .filter(IpList.flagInactive == 0, IpList.flagUserDefined == 0)
             .all()
         ]
     finally:
@@ -208,7 +214,11 @@ def _sync_schedule() -> None:
     try:
         rows = (
             db.query(IpList.id, IpList.fetchFrequencyHours)
-            .filter(IpList.flagInactive == 0, IpList.fetchFrequencyHours > 0)
+            .filter(
+                IpList.flagInactive == 0,
+                IpList.flagUserDefined == 0,
+                IpList.fetchFrequencyHours > 0,
+            )
             .all()
         )
     finally:
