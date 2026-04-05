@@ -1,26 +1,38 @@
 {% extends "base.html" %}
-{% block title %}Manual IP Addresses — Mikrotik Whitelist Service{% endblock %}
+{% block title %}{% if manual_mode %}Manual IP Addresses{% else %}Downloaded IP Addresses{% endif %} — Mikrotik Whitelist Service{% endblock %}
 {% block content %}
 <div class="d-flex align-items-center justify-content-between mb-3">
   <div>
-    <h4 class="mb-1"><i class="bi bi-pencil-square me-2"></i>Manual IP Addresses</h4>
+    <h4 class="mb-1">
+      <i class="bi {% if manual_mode %}bi-pencil-square{% else %}bi-eye{% endif %} me-2"></i>
+      {% if manual_mode %}Manual IP Addresses{% else %}Downloaded IP Addresses{% endif %}
+    </h4>
     <div class="text-muted small">
-      List #{{ iplist.id }} — {{ iplist.description or 'User-defined list' }}
+      List #{{ iplist.id }} — {{ iplist.description or ('User-defined list' if manual_mode else 'Downloaded list') }}
     </div>
   </div>
   <div class="d-flex gap-2">
     <a href="/iplists" class="btn btn-outline-secondary btn-sm">
       <i class="bi bi-arrow-left me-1"></i>Back to IP Lists
     </a>
+    {% if manual_mode %}
     <button class="btn btn-outline-secondary btn-sm" data-bs-toggle="modal" data-bs-target="#bulkImportModal">
       <i class="bi bi-upload me-1"></i>Bulk Import
     </button>
     <button class="btn btn-primary btn-sm" data-bs-toggle="modal" data-bs-target="#addAddressModal">
       <i class="bi bi-plus-lg me-1"></i>Add IP / CIDR
     </button>
+    {% endif %}
   </div>
 </div>
 
+{% if not manual_mode %}
+<div class="alert alert-secondary py-2">
+  This view shows the downloaded IP addresses currently stored in the database for this source list. Entries on this page are read-only.
+</div>
+{% endif %}
+
+{% if manual_mode %}
 {% if request.query_params.get('bulk_error') %}
 <div class="alert alert-danger py-2">
   Nothing was imported. Paste IPs/CIDRs into the text box, upload a text file, or both.
@@ -39,6 +51,7 @@
 <div class="alert alert-secondary py-2">
   This editor is only for <strong>user-defined</strong> lists. Enter a single IPv4 address or CIDR per row. Bare IPs are normalized to <code>/32</code>.
 </div>
+{% endif %}
 
 <div class="table-responsive">
   <table class="table table-hover table-bordered bg-white shadow-sm rounded">
@@ -57,17 +70,42 @@
     <tbody>
       {% for row in addresses %}
       <tr>
+        {% if manual_mode %}
         <form method="post" action="/iplists/{{ iplist.id }}/addresses/{{ row.id }}/save">
+        {% endif %}
         <td class="text-muted small">{{ row.id }}</td>
-        <td><input name="ipAddress" class="form-control form-control-sm" value="{{ row.ipAddress }}" required></td>
-        <td><input name="description" class="form-control form-control-sm" value="{{ row.description or '' }}"></td>
-        <td><input name="comment" class="form-control form-control-sm" value="{{ row.comment or '' }}"></td>
+        <td>
+          {% if manual_mode %}
+          <input name="ipAddress" class="form-control form-control-sm" value="{{ row.ipAddress }}" required>
+          {% else %}
+          <span class="form-control form-control-sm bg-body-secondary">{{ row.ipAddress }}</span>
+          {% endif %}
+        </td>
+        <td>
+          {% if manual_mode %}
+          <input name="description" class="form-control form-control-sm" value="{{ row.description or '' }}">
+          {% else %}
+          <span class="form-control form-control-sm bg-body-secondary">{{ row.description or '—' }}</span>
+          {% endif %}
+        </td>
+        <td>
+          {% if manual_mode %}
+          <input name="comment" class="form-control form-control-sm" value="{{ row.comment or '' }}">
+          {% else %}
+          <span class="form-control form-control-sm bg-body-secondary">{{ row.comment or '—' }}</span>
+          {% endif %}
+        </td>
         <td class="text-center">
+          {% if manual_mode %}
           <input name="flagInactive" type="checkbox" class="form-check-input" value="1" {% if row.flagInactive == 1 %}checked{% endif %}>
+          {% else %}
+          <input type="checkbox" class="form-check-input" {% if row.flagInactive == 1 %}checked{% endif %} disabled>
+          {% endif %}
         </td>
         <td class="small text-muted">{{ row.createDate.strftime('%Y-%m-%d %H:%M:%S') }}</td>
         <td class="small text-muted">{{ row.updateDate.strftime('%Y-%m-%d %H:%M:%S') }}</td>
         <td>
+          {% if manual_mode %}
           <div class="d-flex gap-1">
             <button type="submit" class="btn btn-sm btn-outline-primary" title="Save">
               <i class="bi bi-floppy"></i>
@@ -80,15 +118,19 @@
               </button>
             </form>
           </div>
+          {% else %}
+          <span class="text-muted small">View only</span>
+          {% endif %}
         </td>
       </tr>
       {% else %}
-      <tr><td colspan="8" class="text-center text-muted py-3">No manual IP entries yet. Add one above.</td></tr>
+      <tr><td colspan="8" class="text-center text-muted py-3">{% if manual_mode %}No manual IP entries yet. Add one above.{% else %}No downloaded IP entries are currently stored for this list.{% endif %}</td></tr>
       {% endfor %}
     </tbody>
   </table>
 </div>
 
+{% if manual_mode %}
 <div class="modal fade" id="bulkImportModal" tabindex="-1">
   <div class="modal-dialog modal-lg">
     <form method="post" action="/iplists/{{ iplist.id }}/addresses/bulk" enctype="multipart/form-data">
@@ -117,7 +159,9 @@
     </form>
   </div>
 </div>
+{% endif %}
 
+{% if manual_mode %}
 <div class="modal fade" id="addAddressModal" tabindex="-1">
   <div class="modal-dialog">
     <form method="post" action="/iplists/{{ iplist.id }}/addresses/new">
@@ -152,4 +196,5 @@
     </form>
   </div>
 </div>
+{% endif %}
 {% endblock %}

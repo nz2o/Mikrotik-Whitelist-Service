@@ -72,6 +72,13 @@ def _get_manual_list_or_404(db: Session, iplist_id: int) -> IpList:
     return row
 
 
+def _get_iplist_or_404(db: Session, iplist_id: int) -> IpList:
+    row = db.query(IpList).filter(IpList.id == iplist_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="IP list not found")
+    return row
+
+
 # ---------------------------------------------------------------------------
 # Configuration page
 # ---------------------------------------------------------------------------
@@ -208,7 +215,7 @@ def delete_iplist(iplist_id: int, db: Session = Depends(get_db)):
 
 @router.get("/iplists/{iplist_id}/addresses", response_class=HTMLResponse)
 def page_ipaddresses(iplist_id: int, request: Request, db: Session = Depends(get_db)):
-    iplist = _get_manual_list_or_404(db, iplist_id)
+    iplist = _get_iplist_or_404(db, iplist_id)
     addresses = (
         db.query(IpAddress)
         .filter(IpAddress.iplistsId == iplist_id)
@@ -218,7 +225,11 @@ def page_ipaddresses(iplist_id: int, request: Request, db: Session = Depends(get
     return templates.TemplateResponse(
         request,
         "ipaddresses.html",
-        {"iplist": iplist, "addresses": addresses},
+        {
+            "iplist": iplist,
+            "addresses": addresses,
+            "manual_mode": iplist.flagUserDefined == 1,
+        },
     )
 
 

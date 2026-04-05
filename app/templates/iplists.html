@@ -91,6 +91,10 @@
                 onclick="triggerFetch({{ row.id }}, this)">
           <i class="bi bi-arrow-clockwise"></i>
         </button>
+        <a class="btn btn-sm btn-outline-secondary" title="View Downloaded IPs"
+           href="/iplists/{{ row.id }}/addresses">
+          <i class="bi bi-eye"></i>
+        </a>
         {% else %}
         <a class="btn btn-sm btn-outline-secondary" title="Edit Manual IPs"
            href="/iplists/{{ row.id }}/addresses">
