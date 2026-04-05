@@ -119,3 +119,12 @@ Allow/deny overlap handling is left to your MikroTik firewall rules — the serv
 ## License
 
 See [LICENSE](LICENSE).
+
+---
+
+## Disclaimer
+
+- This project is provided **as-is**, with **no warranty** of any kind.
+- You are responsible for implementing and maintaining appropriate security controls, including authentication, authorization, network segmentation, and access restrictions.
+- This software was intended for **internal use in a home lab** environment.
+- I am not responsible for any damage that occurs resulting from your use of this software.
