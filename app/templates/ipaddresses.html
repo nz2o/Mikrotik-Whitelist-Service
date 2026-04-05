@@ -12,11 +12,29 @@
     <a href="/iplists" class="btn btn-outline-secondary btn-sm">
       <i class="bi bi-arrow-left me-1"></i>Back to IP Lists
     </a>
+    <button class="btn btn-outline-secondary btn-sm" data-bs-toggle="modal" data-bs-target="#bulkImportModal">
+      <i class="bi bi-upload me-1"></i>Bulk Import
+    </button>
     <button class="btn btn-primary btn-sm" data-bs-toggle="modal" data-bs-target="#addAddressModal">
       <i class="bi bi-plus-lg me-1"></i>Add IP / CIDR
     </button>
   </div>
 </div>
+
+{% if request.query_params.get('bulk_error') %}
+<div class="alert alert-danger py-2">
+  Nothing was imported. Paste IPs/CIDRs into the text box, upload a text file, or both.
+</div>
+{% endif %}
+
+{% if request.query_params.get('bulk_added') is not none %}
+<div class="alert alert-success py-2">
+  Bulk import complete.
+  Added: <strong>{{ request.query_params.get('bulk_added') }}</strong>
+  | Invalid skipped: <strong>{{ request.query_params.get('bulk_invalid', '0') }}</strong>
+  | Duplicates skipped: <strong>{{ request.query_params.get('bulk_duplicate', '0') }}</strong>
+</div>
+{% endif %}
 
 <div class="alert alert-secondary py-2">
   This editor is only for <strong>user-defined</strong> lists. Enter a single IPv4 address or CIDR per row. Bare IPs are normalized to <code>/32</code>.
@@ -65,6 +83,35 @@
       {% endfor %}
     </tbody>
   </table>
+</div>
+
+<div class="modal fade" id="bulkImportModal" tabindex="-1">
+  <div class="modal-dialog modal-lg">
+    <form method="post" action="/iplists/{{ iplist.id }}/addresses/bulk" enctype="multipart/form-data">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">Bulk Import Manual IPs</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <div class="mb-3">
+            <label class="form-label">Paste IPs / CIDRs</label>
+            <textarea name="bulkText" class="form-control" rows="10" placeholder="One IP or CIDR per line&#10;203.0.113.5&#10;203.0.113.0/24&#10;# comments are allowed"></textarea>
+            <div class="form-text">Blank lines and lines starting with <code>#</code> or <code>;</code> are ignored.</div>
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Or upload a text file</label>
+            <input type="file" name="uploadFile" class="form-control" accept=".txt,text/plain">
+            <div class="form-text">You can provide pasted text, a file upload, or both.</div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="submit" class="btn btn-primary">Import Entries</button>
+        </div>
+      </div>
+    </form>
+  </div>
 </div>
 
 <div class="modal fade" id="addAddressModal" tabindex="-1">

@@ -2,7 +2,7 @@
 
 import ipaddress
 
-from fastapi import APIRouter, Depends, Form, HTTPException, Request
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
@@ -44,6 +44,23 @@ def _set_config(db: Session, key: str, value: str) -> None:
 def _normalize_ipv4_cidr(value: str) -> str:
     network = ipaddress.IPv4Network(value.strip(), strict=False)
     return str(network)
+
+
+def _parse_bulk_ipv4_lines(raw_text: str) -> tuple[list[str], int]:
+    parsed: list[str] = []
+    invalid_count = 0
+    for line in raw_text.splitlines():
+        candidate = line.strip()
+        if not candidate or candidate.startswith("#") or candidate.startswith(";"):
+            continue
+        candidate = candidate.split("#", 1)[0].split(";", 1)[0].strip()
+        if not candidate:
+            continue
+        try:
+            parsed.append(_normalize_ipv4_cidr(candidate))
+        except ValueError:
+            invalid_count += 1
+    return parsed, invalid_count
 
 
 def _get_manual_list_or_404(db: Session, iplist_id: int) -> IpList:
@@ -223,6 +240,68 @@ def create_ipaddress(
     db.add(row)
     db.commit()
     return RedirectResponse(f"/iplists/{iplist_id}/addresses", status_code=303)
+
+
+@router.post("/iplists/{iplist_id}/addresses/bulk")
+async def bulk_import_ipaddresses(
+    iplist_id: int,
+    bulkText: str = Form(""),
+    uploadFile: UploadFile | None = File(default=None),
+    db: Session = Depends(get_db),
+):
+    _get_manual_list_or_404(db, iplist_id)
+
+    chunks: list[str] = []
+    if bulkText.strip():
+        chunks.append(bulkText)
+
+    if uploadFile and uploadFile.filename:
+        uploaded = await uploadFile.read()
+        decoded = uploaded.decode("utf-8", errors="replace")
+        if decoded.strip():
+            chunks.append(decoded)
+
+    if not chunks:
+        return RedirectResponse(
+            f"/iplists/{iplist_id}/addresses?bulk_error=1",
+            status_code=303,
+        )
+
+    normalized_entries: list[str] = []
+    invalid_count = 0
+    for chunk in chunks:
+        parsed, invalid = _parse_bulk_ipv4_lines(chunk)
+        normalized_entries.extend(parsed)
+        invalid_count += invalid
+
+    unique_entries: list[str] = []
+    seen: set[str] = set()
+    for entry in normalized_entries:
+        if entry not in seen:
+            seen.add(entry)
+            unique_entries.append(entry)
+
+    existing = {
+        row.ipAddress
+        for row in db.query(IpAddress.ipAddress)
+        .filter(IpAddress.iplistsId == iplist_id)
+        .all()
+    }
+
+    to_insert = [entry for entry in unique_entries if entry not in existing]
+    duplicate_count = len(unique_entries) - len(to_insert)
+
+    if to_insert:
+        db.bulk_insert_mappings(
+            IpAddress,
+            [{"ipAddress": entry, "iplistsId": iplist_id} for entry in to_insert],
+        )
+        db.commit()
+
+    return RedirectResponse(
+        f"/iplists/{iplist_id}/addresses?bulk_added={len(to_insert)}&bulk_invalid={invalid_count}&bulk_duplicate={duplicate_count}",
+        status_code=303,
+    )
 
 
 @router.post("/iplists/{iplist_id}/addresses/{address_id}/save")
