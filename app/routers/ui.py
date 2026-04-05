@@ -4,13 +4,14 @@ import ipaddress
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.crypto import encrypt_secret
 from app.database import get_db
+from app.services import applicator as applicator_svc
 from app.models import (
     ApplyHistory,
     Configuration,
@@ -41,6 +42,13 @@ def _set_config(db: Session, key: str, value: str) -> None:
     if row:
         row.configurationItemValue = value
         db.commit()
+
+
+def _text_export_response(content: str, filename: str, download: int) -> PlainTextResponse:
+    response = PlainTextResponse(content)
+    if download == 1:
+        response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return response
 
 
 def _normalize_ipv4_cidr(value: str) -> str:
@@ -212,6 +220,50 @@ def save_configuration(
 # ---------------------------------------------------------------------------
 # IP Lists page
 # ---------------------------------------------------------------------------
+
+
+@router.get("/exports", response_class=HTMLResponse)
+def page_exports(request: Request):
+    return templates.TemplateResponse(
+        request,
+        "exports.html",
+        {},
+    )
+
+
+@router.get("/export/combined/{kind}/{fmt}", response_class=PlainTextResponse)
+def export_combined(kind: str, fmt: str, download: int = 0):
+    if kind not in {"whitelist", "blacklist"}:
+        raise HTTPException(status_code=400, detail="kind must be whitelist or blacklist")
+    if fmt not in {"rsc", "plain"}:
+        raise HTTPException(status_code=400, detail="fmt must be rsc or plain")
+
+    if fmt == "rsc":
+        payload = applicator_svc.build_combined_rsc(kind)
+        filename = f"combined-{kind}.rsc"
+    else:
+        payload = applicator_svc.build_combined_plain(kind)
+        filename = f"combined-{kind}.txt"
+
+    return _text_export_response(payload, filename, download)
+
+
+@router.get("/export/iplist/{iplist_id}/{fmt}", response_class=PlainTextResponse)
+def export_iplist(iplist_id: int, fmt: str, download: int = 0, db: Session = Depends(get_db)):
+    if fmt not in {"rsc", "plain"}:
+        raise HTTPException(status_code=400, detail="fmt must be rsc or plain")
+    iplist = db.query(IpList).filter(IpList.id == iplist_id).first()
+    if not iplist:
+        raise HTTPException(status_code=404, detail="IP list not found")
+
+    if fmt == "rsc":
+        payload = applicator_svc.build_iplist_rsc(iplist_id)
+        filename = f"iplist-{iplist_id}.rsc"
+    else:
+        payload = applicator_svc.build_iplist_plain(iplist_id)
+        filename = f"iplist-{iplist_id}.txt"
+
+    return _text_export_response(payload, filename, download)
 
 
 @router.get("/iplists", response_class=HTMLResponse)

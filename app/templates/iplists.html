@@ -257,6 +257,30 @@
           <i class="bi bi-pencil-square"></i>
         </a>
         {% endif %}
+        <div class="btn-group">
+          <button class="btn btn-sm btn-outline-secondary dropdown-toggle" data-bs-toggle="dropdown" title="Export">
+            <i class="bi bi-box-arrow-down"></i>
+          </button>
+          <ul class="dropdown-menu dropdown-menu-end">
+            <li>
+              <a class="dropdown-item" href="/export/iplist/{{ row.id }}/rsc?download=1">
+                <i class="bi bi-filetype-rs me-2"></i>Download MikroTik Script (.rsc)
+              </a>
+            </li>
+            <li>
+              <a class="dropdown-item" href="/export/iplist/{{ row.id }}/plain?download=1">
+                <i class="bi bi-file-earmark-text me-2"></i>Download CIDR List (.txt)
+              </a>
+            </li>
+            <li><hr class="dropdown-divider"></li>
+            <li>
+              <button type="button" class="dropdown-item"
+                      onclick="copyExportUrl('/export/iplist/{{ row.id }}/plain', this)">
+                <i class="bi bi-link-45deg me-2"></i>Copy Plain-List URL
+              </button>
+            </li>
+          </ul>
+        </div>
         <form method="post" action="/iplists/{{ row.id }}/delete"
               onsubmit="return confirm('Delete list {{ row.id }} and all its IP addresses?')">
           <button type="submit" class="btn btn-sm btn-outline-danger" title="Delete">
@@ -411,6 +435,18 @@ function triggerFetchAll(btn) {
   btn.innerHTML = '<i class="bi bi-hourglass-split me-1"></i>Fetching…';
   fetch('/internal/fetch/all', {method: 'POST'})
     .finally(() => { btn.disabled = false; btn.innerHTML = '<i class="bi bi-arrow-clockwise me-1"></i>Fetch All'; });
+}
+
+async function copyExportUrl(path, btn) {
+  const url = window.location.origin + path;
+  try {
+    await navigator.clipboard.writeText(url);
+    const old = btn.innerHTML;
+    btn.innerHTML = '<i class="bi bi-check2 me-2"></i>Copied';
+    setTimeout(() => { btn.innerHTML = old; }, 1200);
+  } catch (_err) {
+    window.prompt('Copy this URL', url);
+  }
 }
 
 document.addEventListener('DOMContentLoaded', function () {

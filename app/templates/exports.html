@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% block title %}Exports - Mikrotik Whitelist Service{% endblock %}
+{% block content %}
+<div class="d-flex align-items-center justify-content-between mb-3">
+  <h4 class="mb-0"><i class="bi bi-box-arrow-down me-2"></i>Exports</h4>
+  <span class="text-muted small">Download generated files or copy anonymous plain-list URLs</span>
+</div>
+
+<div class="alert alert-info py-2">
+  <i class="bi bi-info-circle me-2"></i>
+  Plain-list endpoints are anonymous and can be consumed by non-MikroTik systems.
+</div>
+
+<div class="row g-3">
+  <div class="col-lg-6">
+    <div class="card shadow-sm border-0 h-100">
+      <div class="card-header d-flex align-items-center justify-content-between">
+        <span><i class="bi bi-shield-check me-2"></i>Combined Whitelist</span>
+        <span class="badge bg-success">Allow</span>
+      </div>
+      <div class="card-body">
+        <p class="text-muted small mb-3">All active whitelist lists, generated exactly like apply processing.</p>
+        <div class="d-grid gap-2">
+          <a class="btn btn-outline-primary" href="/export/combined/whitelist/rsc?download=1">
+            <i class="bi bi-filetype-rs me-2"></i>Download MikroTik Script (.rsc)
+          </a>
+          <a class="btn btn-outline-secondary" href="/export/combined/whitelist/plain?download=1">
+            <i class="bi bi-file-earmark-text me-2"></i>Download Collapsed CIDR List (.txt)
+          </a>
+          <button class="btn btn-outline-dark" onclick="copyExportUrl('/export/combined/whitelist/plain', this)">
+            <i class="bi bi-link-45deg me-2"></i>Copy Plain-List URL
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-lg-6">
+    <div class="card shadow-sm border-0 h-100">
+      <div class="card-header d-flex align-items-center justify-content-between">
+        <span><i class="bi bi-shield-x me-2"></i>Combined Blacklist</span>
+        <span class="badge bg-danger">Deny</span>
+      </div>
+      <div class="card-body">
+        <p class="text-muted small mb-3">All active blacklist lists, generated exactly like apply processing.</p>
+        <div class="d-grid gap-2">
+          <a class="btn btn-outline-primary" href="/export/combined/blacklist/rsc?download=1">
+            <i class="bi bi-filetype-rs me-2"></i>Download MikroTik Script (.rsc)
+          </a>
+          <a class="btn btn-outline-secondary" href="/export/combined/blacklist/plain?download=1">
+            <i class="bi bi-file-earmark-text me-2"></i>Download Collapsed CIDR List (.txt)
+          </a>
+          <button class="btn btn-outline-dark" onclick="copyExportUrl('/export/combined/blacklist/plain', this)">
+            <i class="bi bi-link-45deg me-2"></i>Copy Plain-List URL
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function copyExportUrl(path, btn) {
+  const url = window.location.origin + path;
+  try {
+    await navigator.clipboard.writeText(url);
+    const old = btn.innerHTML;
+    btn.innerHTML = '<i class="bi bi-check2 me-2"></i>Copied';
+    setTimeout(() => { btn.innerHTML = old; }, 1200);
+  } catch (_err) {
+    window.prompt('Copy this URL', url);
+  }
+}
+</script>
+{% endblock %}

@@ -22,7 +22,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from app.config import APPLY_TIMEOUT_SECONDS, FETCH_RETRIES, configure_logging
 from app.crypto import decrypt_secret
 from app.database import SessionLocal
-from app.models import ApplyHistory, Firewall, IpAddress, IpList
+from app.models import ApplyHistory, Configuration, Firewall, IpAddress, IpList
 
 log = logging.getLogger(__name__)
 
@@ -122,6 +122,106 @@ def _make_rsc_chunks(list_name: str, entries: list[tuple[str, int]]) -> list[str
     if not entries:
         chunks = [f'/ip firewall address-list remove [find list="{list_name}"]\n']
     return chunks
+
+
+def _kind_to_list_name(kind: str) -> str:
+    if kind == "whitelist":
+        return "ip-whitelist-dynamic"
+    if kind == "blacklist":
+        return "ip-blacklist-dynamic"
+    raise ValueError("kind must be 'whitelist' or 'blacklist'")
+
+
+def _normalize_ttl(ttl_days: Optional[int]) -> int:
+    if ttl_days is None:
+        return DEFAULT_TTL_DAYS
+    if ttl_days < 1:
+        return DEFAULT_TTL_DAYS
+    return ttl_days
+
+
+def get_combined_entries() -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
+    """Public helper for export and apply consumers."""
+    return _build_datasets()
+
+
+def build_combined_rsc(kind: str) -> str:
+    """Build full RouterOS script for combined whitelist or blacklist."""
+    whitelist, blacklist = get_combined_entries()
+    if kind == "whitelist":
+        entries = whitelist
+    elif kind == "blacklist":
+        entries = blacklist
+    else:
+        raise ValueError("kind must be 'whitelist' or 'blacklist'")
+    list_name = _kind_to_list_name(kind)
+    return "".join(_make_rsc_chunks(list_name, entries))
+
+
+def build_combined_plain(kind: str) -> str:
+    """Build globally collapsed/de-duplicated CIDR list for combined data."""
+    whitelist, blacklist = get_combined_entries()
+    if kind == "whitelist":
+        entries = whitelist
+    elif kind == "blacklist":
+        entries = blacklist
+    else:
+        raise ValueError("kind must be 'whitelist' or 'blacklist'")
+    collapsed = _consolidate([cidr for cidr, _ttl in entries])
+    if not collapsed:
+        return ""
+    return "\n".join(collapsed) + "\n"
+
+
+def _get_iplist_for_export(iplist_id: int) -> Optional[IpList]:
+    db = SessionLocal()
+    try:
+        return db.query(IpList).filter(IpList.id == iplist_id).first()
+    finally:
+        db.close()
+
+
+def _get_iplist_entries(iplist_id: int) -> list[tuple[str, int]]:
+    db = SessionLocal()
+    try:
+        iplist = db.query(IpList).filter(IpList.id == iplist_id).first()
+        if not iplist:
+            return []
+        ttl = _normalize_ttl(iplist.ttlDays)
+        raw = [
+            r.ipAddress
+            for r in db.query(IpAddress.ipAddress)
+            .filter(
+                IpAddress.iplistsId == iplist_id,
+                IpAddress.flagInactive == 0,
+            )
+            .all()
+        ]
+        return [(cidr, ttl) for cidr in _consolidate(raw)]
+    finally:
+        db.close()
+
+
+def build_iplist_rsc(iplist_id: int) -> str:
+    """Build RouterOS script for one IP list using that list's TTL value."""
+    iplist = _get_iplist_for_export(iplist_id)
+    if not iplist:
+        raise ValueError("iplist not found")
+    list_name = "ip-blacklist-dynamic" if iplist.flagBlacklist == 1 else "ip-whitelist-dynamic"
+    entries = _get_iplist_entries(iplist_id)
+    return "".join(_make_rsc_chunks(list_name, entries))
+
+
+def build_iplist_plain(iplist_id: int) -> str:
+    """Build collapsed/de-duplicated CIDR list for a single IP list."""
+    iplist = _get_iplist_for_export(iplist_id)
+    if not iplist:
+        raise ValueError("iplist not found")
+    entries = _get_iplist_entries(iplist_id)
+    collapsed = _consolidate([cidr for cidr, _ttl in entries])
+    if not collapsed:
+        return ""
+    return "\n".join(collapsed) + "\n"
 
 
 # ---------------------------------------------------------------------------
