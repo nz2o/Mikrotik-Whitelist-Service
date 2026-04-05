@@ -60,6 +60,7 @@ class IpList(_StandardMixin, Base):
     comment = Column(Text, nullable=True)
     lastSync = Column(DateTime(timezone=True), nullable=True)
     fetchFrequencyHours = Column(Integer, nullable=False, default=0)
+    ttlDays = Column(Integer, nullable=True)
 
     ipAddresses = relationship(
         "IpAddress", back_populates="ipList", cascade="all, delete-orphan"

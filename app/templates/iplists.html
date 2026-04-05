@@ -176,6 +176,7 @@
       <th>Description</th>
       <th>Comment</th>
       <th>Freq (h)</th>
+      <th>TTL (days)</th>
       <th>Inactive</th>
       <th>Last Sync</th>
       <th>Created</th>
@@ -209,6 +210,10 @@
     <td><input name="description" class="form-control form-control-sm" value="{{ row.description or '' }}"></td>
     <td><input name="comment" class="form-control form-control-sm" value="{{ row.comment or '' }}"></td>
     <td><input name="fetchFrequencyHours" type="number" min="0" class="form-control form-control-sm" value="{{ row.fetchFrequencyHours }}" style="width:70px"></td>
+    <td>
+      <input name="ttlDays" type="number" min="1" class="form-control form-control-sm"
+             value="{{ row.ttlDays or '' }}" placeholder="7" style="width:70px">
+    </td>
     <td class="text-center">
       <input name="flagInactive" type="checkbox" class="form-check-input" value="1"
              {% if row.flagInactive == 1 %}checked{% endif %}>
@@ -262,7 +267,7 @@
     </td>
   </tr>
   {% else %}
-  <tr><td colspan="13" class="text-center text-muted py-3">No IP lists configured yet. Add one above.</td></tr>
+  <tr><td colspan="14" class="text-center text-muted py-3">No IP lists configured yet. Add one above.</td></tr>
   {% endfor %}
   </tbody>
 </table>
@@ -300,6 +305,11 @@
         <div class="col-md-4">
           <label class="form-label">Fetch Frequency (hours)</label>
           <input name="fetchFrequencyHours" type="number" min="0" class="form-control" id="newFetchFrequencyHours" value="24">
+        </div>
+        <div class="col-md-4">
+          <label class="form-label">TTL (days)</label>
+          <input name="ttlDays" type="number" min="1" class="form-control" placeholder="7 (default)">
+          <div class="form-text">How long MikroTik keeps these entries. Leave blank for the default (7 days).</div>
         </div>
         <div class="col-md-4 d-flex align-items-end">
           <div class="form-check">

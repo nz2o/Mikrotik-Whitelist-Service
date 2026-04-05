@@ -22,7 +22,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from app.config import APPLY_TIMEOUT_SECONDS, FETCH_RETRIES, configure_logging
 from app.crypto import decrypt_secret
 from app.database import SessionLocal
-from app.models import ApplyHistory, Configuration, Firewall, IpAddress, IpList
+from app.models import ApplyHistory, Firewall, IpAddress, IpList
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +32,9 @@ CHUNK_SIZE = 500  # max CIDRs per RouterOS script chunk
 # ---------------------------------------------------------------------------
 # CIDR consolidation
 # ---------------------------------------------------------------------------
+
+
+DEFAULT_TTL_DAYS = 7
 
 
 def _consolidate(cidrs: list[str]) -> list[str]:
@@ -46,29 +49,46 @@ def _consolidate(cidrs: list[str]) -> list[str]:
     return [str(n) for n in collapsed]
 
 
-def _build_datasets() -> tuple[list[str], list[str]]:
-    """Return (whitelist_cidrs, blacklist_cidrs) from active ipAddresses."""
+def _build_datasets() -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
+    """Return (whitelist_entries, blacklist_entries) where each entry is (cidr, ttl_days).
+
+    CIDRs are consolidated within each IP list separately so that per-list TTL
+    values are preserved.  Entries from different lists are NOT merged together.
+    """
     db = SessionLocal()
     try:
-        base = (
-            db.query(IpAddress.ipAddress)
-            .join(IpList, IpAddress.iplistsId == IpList.id)
-            .filter(IpAddress.flagInactive == 0, IpList.flagInactive == 0)
+        active_lists = (
+            db.query(IpList)
+            .filter(IpList.flagInactive == 0)
+            .all()
         )
-        whitelist_raw = [
-            r.ipAddress for r in base.filter(IpList.flagBlacklist == 0).all()
-        ]
-        blacklist_raw = [
-            r.ipAddress for r in base.filter(IpList.flagBlacklist == 1).all()
-        ]
+        whitelist_entries: list[tuple[str, int]] = []
+        blacklist_entries: list[tuple[str, int]] = []
+        for il in active_lists:
+            ttl = il.ttlDays if il.ttlDays is not None else DEFAULT_TTL_DAYS
+            raw = [
+                r.ipAddress
+                for r in db.query(IpAddress.ipAddress)
+                .filter(
+                    IpAddress.iplistsId == il.id,
+                    IpAddress.flagInactive == 0,
+                )
+                .all()
+            ]
+            consolidated = _consolidate(raw)
+            entries = [(cidr, ttl) for cidr in consolidated]
+            if il.flagBlacklist == 1:
+                blacklist_entries.extend(entries)
+            else:
+                whitelist_entries.extend(entries)
     finally:
         db.close()
 
-    return _consolidate(whitelist_raw), _consolidate(blacklist_raw)
+    return whitelist_entries, blacklist_entries
 
 
-def _sha256_of(cidrs: list[str]) -> str:
-    joined = "\n".join(sorted(cidrs))
+def _sha256_of(entries: list[tuple[str, int]]) -> str:
+    joined = "\n".join(sorted(f"{cidr}:{ttl}" for cidr, ttl in entries))
     return hashlib.sha256(joined.encode()).hexdigest()
 
 
@@ -77,27 +97,29 @@ def _sha256_of(cidrs: list[str]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _make_rsc_chunks(list_name: str, cidrs: list[str], ttl_days: int) -> list[str]:
+def _make_rsc_chunks(list_name: str, entries: list[tuple[str, int]]) -> list[str]:
     """
     Return a list of RouterOS script strings. The first chunk removes the
     existing address list atomically, subsequent chunks append.
+    Each entry is a (cidr, ttl_days) tuple so different IP lists can carry
+    different TTL values within the same RouterOS address list.
     Split into CHUNK_SIZE batches to avoid SSH/execution timeouts.
     """
     chunks: list[str] = []
-    for batch_index, start in enumerate(range(0, len(cidrs), CHUNK_SIZE)):
-        batch = cidrs[start : start + CHUNK_SIZE]
+    for batch_index, start in enumerate(range(0, len(entries), CHUNK_SIZE)):
+        batch = entries[start : start + CHUNK_SIZE]
         lines: list[str] = []
         if batch_index == 0:
             # Atomic removal of old list before inserting new entries
             lines.append(f'/ip firewall address-list remove [find list="{list_name}"]')
-        for cidr in batch:
+        for cidr, ttl in batch:
             lines.append(
                 f'/ip firewall address-list add list="{list_name}" '
-                f'address={cidr} timeout={ttl_days}d'
+                f'address={cidr} timeout={ttl}d'
             )
         chunks.append("\n".join(lines) + "\n")
-    # Edge case: if cidrs is empty, still remove old list
-    if not cidrs:
+    # Edge case: if entries is empty, still remove old list
+    if not entries:
         chunks = [f'/ip firewall address-list remove [find list="{list_name}"]\n']
     return chunks
 
@@ -143,18 +165,6 @@ def _push_chunks(fw: Firewall, chunks: list[str]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _get_ttl_days(db) -> int:
-    row = (
-        db.query(Configuration)
-        .filter(Configuration.configurationItem == "applicatorTTLDays")
-        .first()
-    )
-    try:
-        return int(row.configurationItemValue) if row else 7
-    except (ValueError, TypeError):
-        return 7
-
-
 def apply_firewall(firewall_id: int, force: bool = False) -> None:
     """Apply address lists to a single firewall.
     
@@ -173,7 +183,7 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
             return
 
         whitelist, blacklist = _build_datasets()
-        wl_hash = _sha256_of(whitelist)
+        wl_hash = _sha256_of(whitelist)  # includes cidr+ttl in hash
         bl_hash = _sha256_of(blacklist)
 
         # Idempotency check (skipped when force=True)
@@ -194,8 +204,6 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
                 )
                 return
 
-        ttl_days = _get_ttl_days(db)
-
         record = ApplyHistory(
             firewallsId=firewall_id,
             status="generating",
@@ -210,8 +218,8 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
         db.refresh(record)
         record_id = record.id
 
-        wl_chunks = _make_rsc_chunks("ip-whitelist-dynamic", whitelist, ttl_days)
-        bl_chunks = _make_rsc_chunks("ip-blacklist-dynamic", blacklist, ttl_days)
+        wl_chunks = _make_rsc_chunks("ip-whitelist-dynamic", whitelist)
+        bl_chunks = _make_rsc_chunks("ip-blacklist-dynamic", blacklist)
 
         _update_history(db, record_id, status="pushing")
 

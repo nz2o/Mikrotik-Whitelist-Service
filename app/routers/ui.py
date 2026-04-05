@@ -1,6 +1,7 @@
 """UI router — serves all HTML pages."""
 
 import ipaddress
+from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -192,7 +193,6 @@ def page_configuration(request: Request, db: Session = Depends(get_db)):
         {
             "fetcherEnabled": _get_config(db, "fetcherEnabled"),
             "applicatorEnabled": _get_config(db, "applicatorEnabled"),
-            "applicatorTTLDays": _get_config(db, "applicatorTTLDays"),
         },
     )
 
@@ -202,12 +202,10 @@ def save_configuration(
     request: Request,
     fetcherEnabled: str = Form("0"),
     applicatorEnabled: str = Form("0"),
-    applicatorTTLDays: str = Form("7"),
     db: Session = Depends(get_db),
 ):
     _set_config(db, "fetcherEnabled", fetcherEnabled)
     _set_config(db, "applicatorEnabled", applicatorEnabled)
-    _set_config(db, "applicatorTTLDays", applicatorTTLDays)
     return RedirectResponse("/configuration?saved=1", status_code=303)
 
 
@@ -267,6 +265,7 @@ def create_iplist(
     comment: str = Form(""),
     fetchFrequencyHours: int = Form(0),
     flagInactive: int = Form(0),
+    ttlDays: Optional[int] = Form(None),
     db: Session = Depends(get_db),
 ):
     normalized_url = (url or "").strip() or None
@@ -280,6 +279,7 @@ def create_iplist(
         comment=comment or None,
         fetchFrequencyHours=0 if flagUserDefined == 1 else fetchFrequencyHours,
         flagInactive=flagInactive,
+        ttlDays=ttlDays if ttlDays and ttlDays >= 1 else None,
     )
     db.add(row)
     db.commit()
@@ -303,6 +303,7 @@ def save_iplist(
     comment: str = Form(""),
     fetchFrequencyHours: int = Form(0),
     flagInactive: int = Form(0),
+    ttlDays: Optional[int] = Form(None),
     db: Session = Depends(get_db),
 ):
     row = db.query(IpList).filter(IpList.id == iplist_id).first()
@@ -318,6 +319,7 @@ def save_iplist(
     row.comment = comment or None
     row.fetchFrequencyHours = 0 if flagUserDefined == 1 else fetchFrequencyHours
     row.flagInactive = flagInactive
+    row.ttlDays = ttlDays if ttlDays and ttlDays >= 1 else None
     db.commit()
     return RedirectResponse("/iplists", status_code=303)
 
