@@ -52,6 +52,30 @@ Four Docker services:
 
 ---
 
+## Screenshots
+
+### IP Lists Management
+
+![IP Lists Management](resources/screenshots/iplists.png)
+
+### Export Center
+
+![Export Center](resources/screenshots/exports.png)
+
+### Configuration
+
+![Configuration](resources/screenshots/configuration.png)
+
+### Firewall Definitions
+
+![Firewall Definitions](resources/screenshots/firewalls.png)
+
+### Status and Logs
+
+![Status and Logs](resources/screenshots/status.png)
+
+---
+
 ## Quick Start
 
 See [install.md](install.md) for full step-by-step instructions.
