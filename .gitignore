@@ -125,11 +125,16 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.venv-*/
+.venv-audit/
 env/
 venv/
 ENV/
 env.bak/
 venv.bak/
+
+# Project-specific local prompts and tooling artifacts
+**/buildprompt.md
 
 # Spyder project settings
 .spyderproject
