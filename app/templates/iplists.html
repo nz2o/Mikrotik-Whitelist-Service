@@ -13,6 +13,157 @@
   </div>
 </div>
 
+<form method="get" action="/iplists" class="card shadow-sm border-0 mb-3">
+  <div class="card-body">
+    <div class="row g-2 align-items-end">
+      <div class="col-lg-8">
+        <label class="form-label">Search IP or CIDR</label>
+        <input name="search" class="form-control" value="{{ search_query or '' }}" placeholder="10.0.0.5 or 10.0.0.0/16">
+        <div class="form-text">CIDR searches return exact matches and broader containing networks. IP searches return exact IP rows and any containing CIDRs.</div>
+      </div>
+      <div class="col-lg-4 d-flex gap-2">
+        <button type="submit" class="btn btn-primary">
+          <i class="bi bi-search me-1"></i>Search
+        </button>
+        {% if search_query %}
+        <a href="/iplists" class="btn btn-outline-secondary">Clear</a>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</form>
+
+{% if search_error %}
+<div class="alert alert-danger py-2">{{ search_error }}</div>
+{% elif search_query %}
+<div class="card shadow-sm border-0 mb-3">
+  <div class="card-header d-flex align-items-center justify-content-between">
+    <span>
+      <i class="bi bi-search me-2"></i>Search Results
+    </span>
+    <span class="text-muted small">
+      {{ search_results|length }} match{{ '' if search_results|length == 1 else 'es' }} for <strong>{{ normalized_search }}</strong>
+    </span>
+  </div>
+  <div class="card-body p-0">
+    <div class="table-responsive">
+      <table class="table table-hover table-bordered mb-0 bg-white">
+        <thead class="table-dark">
+          <tr>
+            <th>List</th>
+            <th>Source</th>
+            <th>Type</th>
+            <th>Match</th>
+            <th>Stored Entry</th>
+            <th>Entry Description</th>
+            <th>Entry Comment</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in search_results %}
+          <tr>
+            <td>
+              <div class="fw-semibold">#{{ row.iplist_id }}</div>
+              <div class="small text-muted">{{ row.iplist_description or 'No description' }}</div>
+            </td>
+            <td>{% if row.iplist_flag_user_defined == 1 %}User Defined{% else %}Downloaded{% endif %}</td>
+            <td>{% if row.iplist_flag_blacklist == 1 %}Deny{% else %}Allow{% endif %}</td>
+            <td>
+              {% if row.match_type == 'exact' %}
+              <span class="badge bg-success">Exact</span>
+              {% elif row.match_type == 'contains-ip' %}
+              <span class="badge bg-info text-dark">Contains IP</span>
+              {% else %}
+              <span class="badge bg-info text-dark">Contains CIDR</span>
+              {% endif %}
+            </td>
+            <td><code>{{ row.matched_address }}</code>
+              {% if row.address_flag_inactive == 1 %}<span class="badge bg-secondary ms-1">Inactive</span>{% endif %}
+            </td>
+            <td>{{ row.address_description or '—' }}</td>
+            <td>{{ row.address_comment or '—' }}</td>
+            <td>
+              <div class="d-flex gap-1">
+              <button class="btn btn-sm btn-outline-warning"
+                      title="Quick Edit"
+                      data-iplist-id="{{ row.iplist_id }}"
+                      data-address-id="{{ row.address_id }}"
+                      data-matched-address="{{ row.matched_address }}"
+                      data-flag-blacklist="{{ row.iplist_flag_blacklist }}"
+                      data-iplist-flag-inactive="{{ row.iplist_flag_inactive }}"
+                      data-address-flag-inactive="{{ row.address_flag_inactive }}"
+                      data-iplist-description="{{ row.iplist_description or '' }}"
+                      onclick="openSearchQuickEdit(this)">
+                <i class="bi bi-pencil"></i>
+              </button>
+              <a class="btn btn-sm btn-outline-secondary" href="/iplists/{{ row.iplist_id }}/addresses">
+                <i class="bi {% if row.iplist_flag_user_defined == 1 %}bi-pencil-square{% else %}bi-eye{% endif %} me-1"></i>
+                {% if row.iplist_flag_user_defined == 1 %}Editor{% else %}Viewer{% endif %}
+              </a>
+              </div>
+            </td>
+          </tr>
+          {% else %}
+          <tr><td colspan="8" class="text-center text-muted py-3">No matches found.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+<!-- Search Quick-Edit Modal -->
+<div class="modal fade" id="searchQuickEditModal" tabindex="-1">
+  <div class="modal-dialog">
+    <form method="post" id="searchQuickEditForm">
+      <input type="hidden" name="redirect_to" id="sqe-redirect">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title"><i class="bi bi-pencil me-2"></i>Quick Edit</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <p class="text-muted small mb-3" id="sqe-header"></p>
+
+          <div class="card mb-3">
+            <div class="card-header small fw-semibold">IP Address Entry</div>
+            <div class="card-body py-2">
+              <div class="mb-2 small fw-semibold text-muted" id="sqe-address"></div>
+              <div class="form-check">
+                <input name="address_flag_inactive" type="checkbox" class="form-check-input" value="1" id="sqe-address-inactive">
+                <label class="form-check-label" for="sqe-address-inactive">Mark address entry inactive</label>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header small fw-semibold">Parent IP List</div>
+            <div class="card-body py-2">
+              <div class="mb-2">
+                <label class="form-label form-label-sm mb-1">Type</label>
+                <select name="flag_blacklist" class="form-select form-select-sm" id="sqe-flag-blacklist">
+                  <option value="0">✅ Allow / Whitelist</option>
+                  <option value="1">🚫 Deny / Blacklist</option>
+                </select>
+              </div>
+              <div class="form-check">
+                <input name="iplist_flag_inactive" type="checkbox" class="form-check-input" value="1" id="sqe-list-inactive">
+                <label class="form-check-label" for="sqe-list-inactive">Mark list inactive</label>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="submit" class="btn btn-primary">Save Changes</button>
+        </div>
+      </div>
+    </form>
+  </div>
+</div>
+
 <!-- Table -->
 <div class="table-responsive">
 <table class="table table-hover table-bordered bg-white shadow-sm rounded">
@@ -222,6 +373,22 @@ function toggleNewListSource(value) {
     }
     submitButton.textContent = 'Add & Fetch';
   }
+}
+
+function openSearchQuickEdit(btn) {
+  const d = btn.dataset;
+  const modal = document.getElementById('searchQuickEditModal');
+  document.getElementById('sqe-header').textContent =
+    'List #' + d.iplistId + (d.iplistDescription ? ' — ' + d.iplistDescription : '');
+  document.getElementById('sqe-address').textContent = d.matchedAddress;
+  document.getElementById('sqe-flag-blacklist').value = d.flagBlacklist;
+  document.getElementById('sqe-list-inactive').checked = d.iplistFlagInactive === '1';
+  document.getElementById('sqe-address-inactive').checked = d.addressFlagInactive === '1';
+  const search = window.location.search;
+  document.getElementById('sqe-redirect').value = '/iplists' + search;
+  document.getElementById('searchQuickEditForm').action =
+    '/iplists/' + d.iplistId + '/addresses/' + d.addressId + '/quick-edit';
+  bootstrap.Modal.getOrCreateInstance(modal).show();
 }
 
 function triggerFetch(id, btn) {

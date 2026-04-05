@@ -5,6 +5,7 @@ import ipaddress
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.crypto import encrypt_secret
@@ -79,6 +80,104 @@ def _get_iplist_or_404(db: Session, iplist_id: int) -> IpList:
     return row
 
 
+def _parse_search_target(raw_value: str) -> tuple[str, str]:
+    value = (raw_value or "").strip()
+    if not value:
+        raise ValueError("Enter an IPv4 address or CIDR to search")
+    try:
+        if "/" in value:
+            return "cidr", str(ipaddress.IPv4Network(value, strict=False))
+        return "ip", str(ipaddress.IPv4Address(value))
+    except ipaddress.AddressValueError as exc:
+        raise ValueError("Enter a valid IPv4 address or CIDR") from exc
+    except ipaddress.NetmaskValueError as exc:
+        raise ValueError("Enter a valid IPv4 address or CIDR") from exc
+
+
+def _search_iplists(db: Session, raw_value: str) -> tuple[str, str, list[dict[str, object]]]:
+    search_kind, normalized_value = _parse_search_target(raw_value)
+
+    if search_kind == "ip":
+        rows = db.execute(
+            text(
+                """
+                SELECT
+                    il.id AS iplist_id,
+                    il."flagUserDefined" AS iplist_flag_user_defined,
+                    il."flagBlacklist" AS iplist_flag_blacklist,
+                    il."flagInactive" AS iplist_flag_inactive,
+                    il.description AS iplist_description,
+                    il.comment AS iplist_comment,
+                    il.url AS iplist_url,
+                    ia.id AS address_id,
+                    ia."ipAddress" AS matched_address,
+                    ia.description AS address_description,
+                    ia.comment AS address_comment,
+                    ia."flagInactive" AS address_flag_inactive,
+                    CASE
+                        WHEN CAST(ia."ipAddress" AS cidr) = CAST(:exact_network AS cidr) THEN 'exact'
+                        ELSE 'contains-ip'
+                    END AS match_type,
+                    masklen(CAST(ia."ipAddress" AS cidr)) AS prefix_length
+                FROM iplist."ipAddresses" ia
+                JOIN iplist.iplists il ON il.id = ia."iplistsId"
+                WHERE CAST(ia."ipAddress" AS cidr) >>= CAST(:query_ip AS inet)
+                ORDER BY
+                    CASE
+                        WHEN CAST(ia."ipAddress" AS cidr) = CAST(:exact_network AS cidr) THEN 0
+                        ELSE 1
+                    END,
+                    masklen(CAST(ia."ipAddress" AS cidr)) DESC,
+                    il.id,
+                    ia.id
+                """
+            ),
+            {
+                "query_ip": normalized_value,
+                "exact_network": f"{normalized_value}/32",
+            },
+        ).mappings()
+    else:
+        rows = db.execute(
+            text(
+                """
+                SELECT
+                    il.id AS iplist_id,
+                    il."flagUserDefined" AS iplist_flag_user_defined,
+                    il."flagBlacklist" AS iplist_flag_blacklist,
+                    il."flagInactive" AS iplist_flag_inactive,
+                    il.description AS iplist_description,
+                    il.comment AS iplist_comment,
+                    il.url AS iplist_url,
+                    ia.id AS address_id,
+                    ia."ipAddress" AS matched_address,
+                    ia.description AS address_description,
+                    ia.comment AS address_comment,
+                    ia."flagInactive" AS address_flag_inactive,
+                    CASE
+                        WHEN CAST(ia."ipAddress" AS cidr) = CAST(:query_cidr AS cidr) THEN 'exact'
+                        ELSE 'contains-cidr'
+                    END AS match_type,
+                    masklen(CAST(ia."ipAddress" AS cidr)) AS prefix_length
+                FROM iplist."ipAddresses" ia
+                JOIN iplist.iplists il ON il.id = ia."iplistsId"
+                WHERE CAST(ia."ipAddress" AS cidr) >>= CAST(:query_cidr AS cidr)
+                ORDER BY
+                    CASE
+                        WHEN CAST(ia."ipAddress" AS cidr) = CAST(:query_cidr AS cidr) THEN 0
+                        ELSE 1
+                    END,
+                    masklen(CAST(ia."ipAddress" AS cidr)) DESC,
+                    il.id,
+                    ia.id
+                """
+            ),
+            {"query_cidr": normalized_value},
+        ).mappings()
+
+    return search_kind, normalized_value, [dict(row) for row in rows]
+
+
 # ---------------------------------------------------------------------------
 # Configuration page
 # ---------------------------------------------------------------------------
@@ -132,10 +231,30 @@ def page_iplists(request: Request, db: Session = Depends(get_db)):
         )
         last_jobs[iplist.id] = job
 
+    search_query = (request.query_params.get("search") or "").strip()
+    search_kind = None
+    search_error = None
+    search_results: list[dict[str, object]] = []
+    normalized_search = ""
+
+    if search_query:
+        try:
+            search_kind, normalized_search, search_results = _search_iplists(db, search_query)
+        except ValueError as exc:
+            search_error = str(exc)
+
     return templates.TemplateResponse(
         request,
         "iplists.html",
-        {"iplists": iplists, "last_jobs": last_jobs},
+        {
+            "iplists": iplists,
+            "last_jobs": last_jobs,
+            "search_query": search_query,
+            "search_kind": search_kind,
+            "search_error": search_error,
+            "search_results": search_results,
+            "normalized_search": normalized_search,
+        },
     )
 
 
@@ -211,6 +330,35 @@ def delete_iplist(iplist_id: int, db: Session = Depends(get_db)):
     db.delete(row)
     db.commit()
     return RedirectResponse("/iplists", status_code=303)
+
+
+@router.post("/iplists/{iplist_id}/addresses/{address_id}/quick-edit")
+def quick_edit_search_entry(
+    iplist_id: int,
+    address_id: int,
+    flag_blacklist: int = Form(0),
+    iplist_flag_inactive: int = Form(0),
+    address_flag_inactive: int = Form(0),
+    redirect_to: str = Form("/iplists"),
+    db: Session = Depends(get_db),
+):
+    """Quick-edit the list type + inactive flags from the search results page."""
+    iplist = db.query(IpList).filter(IpList.id == iplist_id).first()
+    if not iplist:
+        raise HTTPException(status_code=404, detail="IP list not found")
+    address = (
+        db.query(IpAddress)
+        .filter(IpAddress.id == address_id, IpAddress.iplistsId == iplist_id)
+        .first()
+    )
+    if not address:
+        raise HTTPException(status_code=404, detail="IP address entry not found")
+
+    iplist.flagBlacklist = flag_blacklist
+    iplist.flagInactive = iplist_flag_inactive
+    address.flagInactive = address_flag_inactive
+    db.commit()
+    return RedirectResponse(redirect_to, status_code=303)
 
 
 @router.get("/iplists/{iplist_id}/addresses", response_class=HTMLResponse)
