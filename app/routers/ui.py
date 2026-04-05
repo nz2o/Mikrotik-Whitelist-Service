@@ -226,6 +226,7 @@ def page_ipaddresses(iplist_id: int, request: Request, db: Session = Depends(get
 def create_ipaddress(
     iplist_id: int,
     ipAddress: str = Form(...),
+    description: str = Form(""),
     comment: str = Form(""),
     flagInactive: int = Form(0),
     db: Session = Depends(get_db),
@@ -234,6 +235,8 @@ def create_ipaddress(
     normalized = _normalize_ipv4_cidr(ipAddress)
     row = IpAddress(
         ipAddress=normalized,
+        description=description or None,
+        comment=comment or None,
         iplistsId=iplist_id,
         flagInactive=flagInactive,
     )
@@ -309,6 +312,8 @@ def save_ipaddress(
     iplist_id: int,
     address_id: int,
     ipAddress: str = Form(...),
+    description: str = Form(""),
+    comment: str = Form(""),
     flagInactive: int = Form(0),
     db: Session = Depends(get_db),
 ):
@@ -321,6 +326,8 @@ def save_ipaddress(
     if not row:
         raise HTTPException(status_code=404, detail="IP address entry not found")
     row.ipAddress = _normalize_ipv4_cidr(ipAddress)
+    row.description = description or None
+    row.comment = comment or None
     row.flagInactive = flagInactive
     db.commit()
     return RedirectResponse(f"/iplists/{iplist_id}/addresses", status_code=303)

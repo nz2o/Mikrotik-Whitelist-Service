@@ -82,6 +82,8 @@ class IpAddress(_StandardMixin, Base):
     )
 
     ipAddress = Column(Text, nullable=False)
+    description = Column(Text, nullable=True)
+    comment = Column(Text, nullable=True)
     iplistsId = Column(
         BigInteger, ForeignKey(f"{SCHEMA}.iplists.id", ondelete="CASCADE"), nullable=False
     )

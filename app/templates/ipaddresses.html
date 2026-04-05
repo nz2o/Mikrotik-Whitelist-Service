@@ -46,6 +46,8 @@
       <tr>
         <th>ID</th>
         <th>IP / CIDR</th>
+        <th>Description</th>
+        <th>Comment</th>
         <th>Inactive</th>
         <th>Created</th>
         <th>Updated</th>
@@ -58,6 +60,8 @@
         <form method="post" action="/iplists/{{ iplist.id }}/addresses/{{ row.id }}/save">
         <td class="text-muted small">{{ row.id }}</td>
         <td><input name="ipAddress" class="form-control form-control-sm" value="{{ row.ipAddress }}" required></td>
+        <td><input name="description" class="form-control form-control-sm" value="{{ row.description or '' }}"></td>
+        <td><input name="comment" class="form-control form-control-sm" value="{{ row.comment or '' }}"></td>
         <td class="text-center">
           <input name="flagInactive" type="checkbox" class="form-check-input" value="1" {% if row.flagInactive == 1 %}checked{% endif %}>
         </td>
@@ -79,7 +83,7 @@
         </td>
       </tr>
       {% else %}
-      <tr><td colspan="6" class="text-center text-muted py-3">No manual IP entries yet. Add one above.</td></tr>
+      <tr><td colspan="8" class="text-center text-muted py-3">No manual IP entries yet. Add one above.</td></tr>
       {% endfor %}
     </tbody>
   </table>
@@ -126,6 +130,14 @@
           <div class="mb-3">
             <label class="form-label">IP / CIDR</label>
             <input name="ipAddress" class="form-control" required placeholder="203.0.113.5 or 203.0.113.0/24">
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Description</label>
+            <input name="description" class="form-control" placeholder="Optional short description">
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Comment</label>
+            <input name="comment" class="form-control" placeholder="Optional note or reason">
           </div>
           <div class="form-check">
             <input name="flagInactive" type="checkbox" class="form-check-input" value="1" id="newAddressInactive">
