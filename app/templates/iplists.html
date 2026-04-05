@@ -177,18 +177,13 @@
       <th>Comment</th>
       <th>Freq (h)</th>
       <th>TTL (days)</th>
-      <th>Inactive</th>
-      <th>Last Sync</th>
-      <th>Created</th>
-      <th>Updated</th>
-      <th>Last Job</th>
       <th>Actions</th>
     </tr>
   </thead>
   <tbody>
   {% for row in iplists %}
   <tr id="row-{{ row.id }}">
-    <form method="post" action="/iplists/{{ row.id }}/save">
+    <form id="iplist-form-{{ row.id }}" method="post" action="/iplists/{{ row.id }}/save">
     <td class="text-muted small">{{ row.id }}</td>
     <td>
       <select name="flagUserDefined" class="form-select form-select-sm" style="min-width:130px">
@@ -202,39 +197,17 @@
              style="min-width:220px">
     </td>
     <td>
-      <select name="flagBlacklist" class="form-select form-select-sm">
+      <select name="flagBlacklist" class="form-select form-select-sm" style="min-width:120px">
         <option value="0" {% if row.flagBlacklist == 0 %}selected{% endif %}>✅ Allow</option>
         <option value="1" {% if row.flagBlacklist == 1 %}selected{% endif %}>🚫 Deny</option>
       </select>
     </td>
-    <td><input name="description" class="form-control form-control-sm" value="{{ row.description or '' }}"></td>
-    <td><input name="comment" class="form-control form-control-sm" value="{{ row.comment or '' }}"></td>
+    <td><input name="description" class="form-control form-control-sm" value="{{ row.description or '' }}" style="min-width:180px"></td>
+    <td><input name="comment" class="form-control form-control-sm" value="{{ row.comment or '' }}" style="min-width:160px"></td>
     <td><input name="fetchFrequencyHours" type="number" min="0" class="form-control form-control-sm" value="{{ row.fetchFrequencyHours }}" style="width:70px"></td>
     <td>
       <input name="ttlDays" type="number" min="1" class="form-control form-control-sm"
              value="{{ row.ttlDays or '' }}" placeholder="7" style="width:70px">
-    </td>
-    <td class="text-center">
-      <input name="flagInactive" type="checkbox" class="form-check-input" value="1"
-             {% if row.flagInactive == 1 %}checked{% endif %}>
-    </td>
-    <td class="small text-muted">{{ row.lastSync.strftime('%Y-%m-%d %H:%M:%S') if row.lastSync else '—' }}</td>
-    <td class="small text-muted">{{ row.createDate.strftime('%Y-%m-%d %H:%M:%S') }}</td>
-    <td class="small text-muted">{{ row.updateDate.strftime('%Y-%m-%d %H:%M:%S') }}</td>
-    <td>
-      {% set job = last_jobs.get(row.id) %}
-      {% if job %}
-        <span class="badge status-badge
-          {% if job.status == 'complete' %}bg-success
-          {% elif job.status == 'failed' %}bg-danger
-          {% elif job.status in ['fetching','parsing','loading'] %}bg-warning text-dark
-          {% else %}bg-secondary{% endif %}">
-          {{ job.status }}
-        </span>
-        {% if job.errorMessage %}
-          <i class="bi bi-exclamation-circle text-danger ms-1" title="{{ job.errorMessage }}"></i>
-        {% endif %}
-      {% else %}<span class="text-muted small">—</span>{% endif %}
     </td>
     <td>
       <div class="d-flex gap-1">
@@ -290,8 +263,39 @@
       </div>
     </td>
   </tr>
+  <tr>
+    <td colspan="9" class="bg-body-tertiary">
+      <div class="d-flex flex-wrap gap-3 align-items-center small">
+        <div class="form-check m-0">
+          <input name="flagInactive" type="checkbox" class="form-check-input" value="1"
+                 form="iplist-form-{{ row.id }}" id="iplist-inactive-{{ row.id }}"
+                 {% if row.flagInactive == 1 %}checked{% endif %}>
+          <label class="form-check-label" for="iplist-inactive-{{ row.id }}">Inactive</label>
+        </div>
+        <span class="text-muted">Last Sync: {{ row.lastSync.strftime('%Y-%m-%d %H:%M:%S') if row.lastSync else '—' }}</span>
+        <span class="text-muted">Created: {{ row.createDate.strftime('%Y-%m-%d %H:%M:%S') }}</span>
+        <span class="text-muted">Updated: {{ row.updateDate.strftime('%Y-%m-%d %H:%M:%S') }}</span>
+        {% set job = last_jobs.get(row.id) %}
+        <span class="text-muted">Last Job:</span>
+        {% if job %}
+          <span class="badge status-badge
+            {% if job.status == 'complete' %}bg-success
+            {% elif job.status == 'failed' %}bg-danger
+            {% elif job.status in ['fetching','parsing','loading'] %}bg-warning text-dark
+            {% else %}bg-secondary{% endif %}">
+            {{ job.status }}
+          </span>
+          {% if job.errorMessage %}
+            <i class="bi bi-exclamation-circle text-danger" title="{{ job.errorMessage }}"></i>
+          {% endif %}
+        {% else %}
+          <span class="text-muted">—</span>
+        {% endif %}
+      </div>
+    </td>
+  </tr>
   {% else %}
-  <tr><td colspan="14" class="text-center text-muted py-3">No IP lists configured yet. Add one above.</td></tr>
+  <tr><td colspan="9" class="text-center text-muted py-3">No IP lists configured yet. Add one above.</td></tr>
   {% endfor %}
   </tbody>
 </table>

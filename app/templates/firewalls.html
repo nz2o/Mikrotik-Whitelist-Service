@@ -24,17 +24,13 @@
       <th>Secret</th>
       <th>Type</th>
       <th>Apply Freq (h)</th>
-      <th>Inactive</th>
-      <th>Created</th>
-      <th>Updated</th>
-      <th>Last Apply</th>
       <th>Actions</th>
     </tr>
   </thead>
   <tbody>
   {% for fw in firewalls %}
   <tr>
-    <form method="post" action="/firewalls/{{ fw.id }}/save">
+    <form id="firewall-form-{{ fw.id }}" method="post" action="/firewalls/{{ fw.id }}/save">
     <td class="text-muted small">{{ fw.id }}</td>
     <td><input name="firewallAddress" class="form-control form-control-sm" value="{{ fw.firewallAddress }}" required></td>
     <td><input name="firewallPort" type="number" class="form-control form-control-sm" value="{{ fw.firewallPort }}" style="width:75px"></td>
@@ -44,7 +40,7 @@
              placeholder="(leave blank to keep)" autocomplete="new-password">
     </td>
     <td>
-      <select name="firewallTypeId" class="form-select form-select-sm">
+      <select name="firewallTypeId" class="form-select form-select-sm" style="min-width:120px">
         {% for t in fw_types %}
         <option value="{{ t.id }}" {% if t.id == fw.firewallTypeId %}selected{% endif %}>
           {{ t.firewallTypeDescription }}
@@ -53,25 +49,6 @@
       </select>
     </td>
     <td><input name="applyFrequencyHours" type="number" min="0" class="form-control form-control-sm" value="{{ fw.applyFrequencyHours }}" style="width:70px"></td>
-    <td class="text-center">
-      <input name="flagInactive" type="checkbox" class="form-check-input" value="1"
-             {% if fw.flagInactive == 1 %}checked{% endif %}>
-    </td>
-    <td class="small text-muted">{{ fw.createDate.strftime('%Y-%m-%d %H:%M:%S') }}</td>
-    <td class="small text-muted">{{ fw.updateDate.strftime('%Y-%m-%d %H:%M:%S') }}</td>
-    <td>
-      {% set ap = last_applies.get(fw.id) %}
-      {% if ap %}
-        <span class="badge status-badge
-          {% if ap.status == 'complete' %}bg-success
-          {% elif ap.status == 'failed' %}bg-danger
-          {% elif ap.status in ['generating','pushing'] %}bg-warning text-dark
-          {% else %}bg-secondary{% endif %}">
-          {{ ap.status }}
-        </span>
-        <div class="small text-muted">{{ ap.startedAt.strftime('%Y-%m-%d %H:%M:%S') if ap.startedAt else '' }}</div>
-      {% else %}<span class="text-muted small">—</span>{% endif %}
-    </td>
     <td>
       <div class="d-flex gap-1">
         <button type="submit" class="btn btn-sm btn-outline-primary" title="Save">
@@ -91,8 +68,36 @@
       </div>
     </td>
   </tr>
+  <tr>
+    <td colspan="8" class="bg-body-tertiary">
+      <div class="d-flex flex-wrap gap-3 align-items-center small">
+        <div class="form-check m-0">
+          <input name="flagInactive" type="checkbox" class="form-check-input" value="1"
+                 form="firewall-form-{{ fw.id }}" id="firewall-inactive-{{ fw.id }}"
+                 {% if fw.flagInactive == 1 %}checked{% endif %}>
+          <label class="form-check-label" for="firewall-inactive-{{ fw.id }}">Inactive</label>
+        </div>
+        <span class="text-muted">Created: {{ fw.createDate.strftime('%Y-%m-%d %H:%M:%S') }}</span>
+        <span class="text-muted">Updated: {{ fw.updateDate.strftime('%Y-%m-%d %H:%M:%S') }}</span>
+        {% set ap = last_applies.get(fw.id) %}
+        <span class="text-muted">Last Apply:</span>
+        {% if ap %}
+          <span class="badge status-badge
+            {% if ap.status == 'complete' %}bg-success
+            {% elif ap.status == 'failed' %}bg-danger
+            {% elif ap.status in ['generating','pushing'] %}bg-warning text-dark
+            {% else %}bg-secondary{% endif %}">
+            {{ ap.status }}
+          </span>
+          <span class="text-muted">{{ ap.startedAt.strftime('%Y-%m-%d %H:%M:%S') if ap.startedAt else '' }}</span>
+        {% else %}
+          <span class="text-muted">—</span>
+        {% endif %}
+      </div>
+    </td>
+  </tr>
   {% else %}
-  <tr><td colspan="12" class="text-center text-muted py-3">No firewalls configured yet.</td></tr>
+  <tr><td colspan="8" class="text-center text-muted py-3">No firewalls configured yet.</td></tr>
   {% endfor %}
   </tbody>
 </table>
