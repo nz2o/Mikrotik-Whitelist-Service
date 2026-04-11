@@ -13,6 +13,8 @@
   </div>
 </div>
 
+<div id="apply-feedback" class="alert d-none py-2" role="alert"></div>
+
 <div class="table-responsive">
 <table class="table table-hover table-bordered bg-white shadow-sm rounded">
   <thead class="table-dark">
@@ -79,6 +81,7 @@
         </div>
         <span class="text-muted">Created: {{ fw.createDate.strftime('%Y-%m-%d %H:%M:%S') }}</span>
         <span class="text-muted">Updated: {{ fw.updateDate.strftime('%Y-%m-%d %H:%M:%S') }}</span>
+        <span class="text-muted" id="apply-status-{{ fw.id }}"></span>
         {% set ap = last_applies.get(fw.id) %}
         <span class="text-muted">Last Apply:</span>
         {% if ap %}
@@ -161,15 +164,109 @@
 
 {% block scripts %}
 <script>
+const activeApplyPollers = new Map();
+
+function showApplyFeedback(level, message) {
+  const box = document.getElementById('apply-feedback');
+  if (!box) {
+    return;
+  }
+  box.className = `alert alert-${level} py-2`;
+  box.textContent = message;
+}
+
+function updateApplyStatusLine(id, message) {
+  const el = document.getElementById(`apply-status-${id}`);
+  if (el) {
+    el.textContent = message;
+  }
+}
+
+function stopApplyPolling(id) {
+  const timer = activeApplyPollers.get(String(id));
+  if (timer) {
+    clearTimeout(timer);
+    activeApplyPollers.delete(String(id));
+  }
+}
+
+function scheduleApplyPoll(id, delayMs) {
+  stopApplyPolling(id);
+  const timer = setTimeout(() => pollApplyStatus(id), delayMs);
+  activeApplyPollers.set(String(id), timer);
+}
+
+function pollApplyStatus(id) {
+  fetch(`/internal/apply/${id}/status`)
+    .then((response) => response.json())
+    .then((data) => {
+      if (data.active) {
+        const message = data.status === 'pushing'
+          ? `Pushing ${data.whitelistCount || 0} allow and ${data.blacklistCount || 0} deny entries`
+          : 'Generating consolidated lists...';
+        updateApplyStatusLine(id, message);
+        showApplyFeedback('info', `Firewall ${id}: ${message}`);
+        scheduleApplyPoll(id, 2000);
+        return;
+      }
+
+      if (data.status === 'complete') {
+        updateApplyStatusLine(id, `Completed: ${data.whitelistCount || 0} allow, ${data.blacklistCount || 0} deny`);
+        showApplyFeedback('success', `Firewall ${id} apply completed. Refreshing status...`);
+        stopApplyPolling(id);
+        setTimeout(() => window.location.reload(), 1200);
+        return;
+      }
+
+      if (data.status === 'failed') {
+        const error = data.lastError || 'apply failed';
+        updateApplyStatusLine(id, `Failed: ${error}`);
+        showApplyFeedback('danger', `Firewall ${id} apply failed: ${error}`);
+        stopApplyPolling(id);
+        return;
+      }
+
+      if (data.status === 'skipped') {
+        updateApplyStatusLine(id, data.lastError || 'Skipped');
+        showApplyFeedback('warning', `Firewall ${id}: ${data.lastError || 'Skipped'}`);
+        stopApplyPolling(id);
+      }
+    })
+    .catch(() => {
+      showApplyFeedback('danger', `Unable to read apply status for firewall ${id}.`);
+      stopApplyPolling(id);
+    });
+}
+
 function triggerApply(id, btn) {
   btn.disabled = true;
+  const originalHtml = btn.innerHTML;
+  btn.innerHTML = '<i class="bi bi-hourglass-split"></i>';
   fetch(`/internal/apply/${id}`, {method: 'POST'})
-    .finally(() => { btn.disabled = false; });
+    .then((response) => response.json())
+    .then((data) => {
+      if (data.status === 'already-running') {
+        showApplyFeedback('info', `Firewall ${id} is already applying.`);
+      } else {
+        showApplyFeedback('info', `Firewall ${id} apply started.`);
+      }
+      pollApplyStatus(id);
+    })
+    .catch(() => {
+      showApplyFeedback('danger', `Unable to start apply for firewall ${id}.`);
+    })
+    .finally(() => {
+      btn.disabled = false;
+      btn.innerHTML = originalHtml;
+    });
 }
 function triggerApplyAll(btn) {
   btn.disabled = true;
   btn.innerHTML = '<i class="bi bi-hourglass-split me-1"></i>Applying…';
   fetch('/internal/apply/all', {method: 'POST'})
+    .then(() => {
+      showApplyFeedback('info', 'Apply All started. Individual firewalls will update as pushes progress.');
+    })
     .finally(() => { btn.disabled = false; btn.innerHTML = '<i class="bi bi-send me-1"></i>Apply All'; });
 }
 </script>

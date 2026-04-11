@@ -12,6 +12,7 @@ Responsibilities:
 import hashlib
 import ipaddress
 import logging
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Optional
@@ -22,11 +23,13 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from app.config import APPLY_TIMEOUT_SECONDS, FETCH_RETRIES, configure_logging
 from app.crypto import decrypt_secret
 from app.database import SessionLocal
-from app.models import ApplyHistory, Configuration, Firewall, IpAddress, IpList
+from app.models import ApplyHistory, Configuration, Domain, DomainList, Firewall, IpAddress, IpList
 
 log = logging.getLogger(__name__)
 
 CHUNK_SIZE = 500  # max CIDRs per RouterOS script chunk
+_APPLY_STATUS_LOCK = threading.Lock()
+_APPLY_STATUS: dict[int, dict[str, object]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +68,67 @@ def _consolidate(cidrs: list[str]) -> list[str]:
     return [str(n) for n in collapsed]
 
 
+def _collapse_entries(entries: list[tuple[str, int]]) -> list[tuple[str, int]]:
+    """Safely collapse combined entries while preserving TTL semantics.
+
+    Rules:
+    - Collapse globally within identical TTL buckets.
+    - For exact duplicate CIDRs across TTLs, keep the longest TTL.
+    - Drop a narrower CIDR only when it is already covered by a broader CIDR
+      with an equal or longer TTL.
+    """
+    ttl_groups: dict[int, list[str]] = {}
+    for cidr, ttl in entries:
+        ttl_groups.setdefault(ttl, []).append(cidr)
+
+    by_network: dict[str, int] = {}
+    for ttl, cidrs in ttl_groups.items():
+        for collapsed_cidr in _consolidate(cidrs):
+            by_network[collapsed_cidr] = max(ttl, by_network.get(collapsed_cidr, 0))
+
+    ordered = sorted(
+        (
+            (ipaddress.IPv4Network(cidr, strict=False), ttl)
+            for cidr, ttl in by_network.items()
+        ),
+        key=lambda item: (item[0].prefixlen, int(item[0].network_address)),
+    )
+
+    result: list[tuple[ipaddress.IPv4Network, int]] = []
+    for network, ttl in ordered:
+        covered = False
+        for existing_network, existing_ttl in result:
+            if network.subnet_of(existing_network) and existing_ttl >= ttl:
+                covered = True
+                break
+        if covered:
+            continue
+        result.append((network, ttl))
+
+    return [(str(network), ttl) for network, ttl in result]
+
+
+def _update_apply_status(firewall_id: int, **updates) -> None:
+    with _APPLY_STATUS_LOCK:
+        current = dict(_APPLY_STATUS.get(firewall_id, {}))
+        current.update(updates)
+        _APPLY_STATUS[firewall_id] = current
+
+
+def get_apply_status(firewall_id: int) -> dict[str, object]:
+    with _APPLY_STATUS_LOCK:
+        return dict(_APPLY_STATUS.get(firewall_id, {}))
+
+
+def trigger_apply_async(firewall_id: int, force: bool = False) -> bool:
+    with _APPLY_STATUS_LOCK:
+        current = _APPLY_STATUS.get(firewall_id, {})
+        if current.get("active"):
+            return False
+    threading.Thread(target=apply_firewall, args=(firewall_id, force), daemon=True).start()
+    return True
+
+
 def _build_datasets() -> dict[int, list[tuple[str, int]]]:
     """Return map of list_type -> [(cidr, ttl_days), ...].
 
@@ -90,6 +154,27 @@ def _build_datasets() -> dict[int, list[tuple[str, int]]]:
                 .filter(
                     IpAddress.iplistsId == il.id,
                     IpAddress.flagInactive == 0,
+                )
+                .all()
+            ]
+            consolidated = _consolidate(raw)
+            entries = [(cidr, ttl) for cidr in consolidated]
+            datasets[list_type].extend(entries)
+
+        active_domain_lists = (
+            db.query(DomainList)
+            .filter(DomainList.flagInactive == 0)
+            .all()
+        )
+        for dl in active_domain_lists:
+            ttl = dl.ttlDays if dl.ttlDays is not None else DEFAULT_TTL_DAYS
+            list_type = dl.listType if dl.listType in datasets else IpList.TYPE_ALLOW
+            raw = [
+                r.ipAddress
+                for r in db.query(Domain.ipAddress)
+                .filter(
+                    Domain.domainListsId == dl.id,
+                    Domain.flagInactive == 0,
                 )
                 .all()
             ]
@@ -155,7 +240,8 @@ def _normalize_ttl(ttl_days: Optional[int]) -> int:
 
 def get_combined_entries() -> dict[int, list[tuple[str, int]]]:
     """Public helper for export and apply consumers."""
-    return _build_datasets()
+    datasets = _build_datasets()
+    return {list_type: _collapse_entries(entries) for list_type, entries in datasets.items()}
 
 
 def build_combined_rsc(kind: str) -> str:
@@ -280,17 +366,48 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
         firewall_id: The firewalls.id to apply to.
         force: If True, skip idempotency hash check (used for manual Apply Now).
     """
+    with _APPLY_STATUS_LOCK:
+        current = _APPLY_STATUS.get(firewall_id, {})
+        if current.get("active"):
+            log.info("Apply already running", extra={"firewallsId": firewall_id})
+            return
+        _APPLY_STATUS[firewall_id] = {
+            "firewallsId": firewall_id,
+            "active": True,
+            "status": "starting",
+            "startedAt": datetime.now(timezone.utc).isoformat(),
+            "finishedAt": None,
+            "whitelistCount": 0,
+            "blacklistCount": 0,
+            "lastError": None,
+        }
+
     db = SessionLocal()
     try:
         fw = db.query(Firewall).filter(Firewall.id == firewall_id).first()
         if not fw:
             log.error("Firewall not found", extra={"firewallsId": firewall_id})
+            _update_apply_status(
+                firewall_id,
+                active=False,
+                status="failed",
+                finishedAt=datetime.now(timezone.utc).isoformat(),
+                lastError="firewall not found",
+            )
             return
         if fw.flagInactive == 1:
             log.info("Skipping inactive firewall", extra={"firewallsId": firewall_id})
+            _update_apply_status(
+                firewall_id,
+                active=False,
+                status="skipped",
+                finishedAt=datetime.now(timezone.utc).isoformat(),
+                lastError="inactive firewall",
+            )
             return
 
-        datasets = _build_datasets()
+        _update_apply_status(firewall_id, status="generating")
+        datasets = get_combined_entries()
         allow_entries = datasets.get(IpList.TYPE_ALLOW, [])
         other_entries = []
         for code, _label in IpList.TYPE_OPTIONS:
@@ -316,6 +433,15 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
                     "Address lists unchanged; skipping apply",
                     extra={"firewallsId": firewall_id},
                 )
+                _update_apply_status(
+                    firewall_id,
+                    active=False,
+                    status="skipped",
+                    finishedAt=datetime.now(timezone.utc).isoformat(),
+                    whitelistCount=len(allow_entries),
+                    blacklistCount=len(other_entries),
+                    lastError="address lists unchanged",
+                )
                 return
 
         record = ApplyHistory(
@@ -338,6 +464,13 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
             all_chunks.extend(_make_rsc_chunks(list_name, datasets.get(code, [])))
 
         _update_history(db, record_id, status="pushing")
+        _update_apply_status(
+            firewall_id,
+            status="pushing",
+            whitelistCount=len(allow_entries),
+            blacklistCount=len(other_entries),
+            lastError=None,
+        )
 
         last_err: str | None = None
         pushed = False
@@ -362,6 +495,15 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
                 status="complete",
                 completedAt=datetime.now(timezone.utc),
             )
+            _update_apply_status(
+                firewall_id,
+                active=False,
+                status="complete",
+                finishedAt=datetime.now(timezone.utc).isoformat(),
+                whitelistCount=len(allow_entries),
+                blacklistCount=len(other_entries),
+                lastError=None,
+            )
             log.info(
                 "Apply complete",
                 extra={
@@ -378,10 +520,28 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
                 completedAt=datetime.now(timezone.utc),
                 errorMessage=last_err,
             )
+            _update_apply_status(
+                firewall_id,
+                active=False,
+                status="failed",
+                finishedAt=datetime.now(timezone.utc).isoformat(),
+                whitelistCount=len(allow_entries),
+                blacklistCount=len(other_entries),
+                lastError=last_err,
+            )
             log.error(
                 "Apply failed",
                 extra={"firewallsId": firewall_id, "error": last_err},
             )
+    except Exception as exc:
+        _update_apply_status(
+            firewall_id,
+            active=False,
+            status="failed",
+            finishedAt=datetime.now(timezone.utc).isoformat(),
+            lastError=str(exc),
+        )
+        raise
     finally:
         db.close()
 

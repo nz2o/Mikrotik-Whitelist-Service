@@ -15,6 +15,8 @@ from app.services import applicator as applicator_svc
 from app.models import (
     ApplyHistory,
     Configuration,
+    Domain,
+    DomainList,
     FetchError,
     FetchJob,
     Firewall,
@@ -333,6 +335,115 @@ def page_iplists(request: Request, db: Session = Depends(get_db)):
             "normalized_search": normalized_search,
         },
     )
+
+
+@router.get("/domainlists", response_class=HTMLResponse)
+def page_domainlists(request: Request, db: Session = Depends(get_db)):
+    domain_lists = db.query(DomainList).order_by(DomainList.id).all()
+    resolved_counts: dict[int, int] = {}
+    for row in domain_lists:
+        resolved_counts[row.id] = (
+            db.query(Domain.id)
+            .filter(Domain.domainListsId == row.id, Domain.flagInactive == 0)
+            .count()
+        )
+
+    return templates.TemplateResponse(
+        request,
+        "domainlists.html",
+        {
+            "domain_lists": domain_lists,
+            "resolved_counts": resolved_counts,
+            "list_type_options": LIST_TYPE_OPTIONS,
+            "list_type_labels": LIST_TYPE_LABELS,
+            "list_type_kind_map": LIST_TYPE_KIND_MAP,
+        },
+    )
+
+
+@router.post("/domainlists/new")
+def create_domain_list(
+    url: str = Form(""),
+    flagUserDefined: int = Form(0),
+    listType: int = Form(IpList.TYPE_ALLOW),
+    description: str = Form(""),
+    comment: str = Form(""),
+    fetchFrequencyHours: int = Form(0),
+    flagInactive: int = Form(0),
+    ttlDays: Optional[int] = Form(None),
+    db: Session = Depends(get_db),
+):
+    normalized_url = (url or "").strip() or None
+    if flagUserDefined != 1 and not normalized_url:
+        raise HTTPException(status_code=400, detail="URL is required for downloaded lists")
+
+    row = DomainList(
+        url=normalized_url,
+        flagUserDefined=flagUserDefined,
+        listType=_normalize_list_type(listType),
+        description=description or None,
+        comment=comment or None,
+        fetchFrequencyHours=0 if flagUserDefined == 1 else fetchFrequencyHours,
+        flagInactive=flagInactive,
+        ttlDays=ttlDays if ttlDays and ttlDays >= 1 else None,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    if row.flagUserDefined != 1:
+        from app.services import fetcher as fetcher_svc
+
+        fetcher_svc.trigger_domain_fetch_async(row.id)
+        return RedirectResponse(f"/domainlists?fetchStarted={row.id}", status_code=303)
+    return RedirectResponse("/domainlists", status_code=303)
+
+
+@router.post("/domainlists/{domain_list_id}/save")
+def save_domain_list(
+    domain_list_id: int,
+    url: str = Form(""),
+    flagUserDefined: int = Form(0),
+    listType: int = Form(IpList.TYPE_ALLOW),
+    description: str = Form(""),
+    comment: str = Form(""),
+    fetchFrequencyHours: int = Form(0),
+    flagInactive: int = Form(0),
+    ttlDays: Optional[int] = Form(None),
+    db: Session = Depends(get_db),
+):
+    row = db.query(DomainList).filter(DomainList.id == domain_list_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Domain list not found")
+
+    normalized_url = (url or "").strip() or None
+    if flagUserDefined != 1 and not normalized_url:
+        raise HTTPException(status_code=400, detail="URL is required for downloaded lists")
+
+    row.url = normalized_url
+    row.flagUserDefined = flagUserDefined
+    row.listType = _normalize_list_type(listType)
+    row.description = description or None
+    row.comment = comment or None
+    row.fetchFrequencyHours = 0 if flagUserDefined == 1 else fetchFrequencyHours
+    row.flagInactive = flagInactive
+    row.ttlDays = ttlDays if ttlDays and ttlDays >= 1 else None
+    db.commit()
+    if row.flagUserDefined != 1:
+        from app.services import fetcher as fetcher_svc
+
+        fetcher_svc.trigger_domain_fetch_async(row.id)
+        return RedirectResponse(f"/domainlists?fetchStarted={row.id}", status_code=303)
+    return RedirectResponse("/domainlists", status_code=303)
+
+
+@router.post("/domainlists/{domain_list_id}/delete")
+def delete_domain_list(domain_list_id: int, db: Session = Depends(get_db)):
+    row = db.query(DomainList).filter(DomainList.id == domain_list_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Domain list not found")
+    db.delete(row)
+    db.commit()
+    return RedirectResponse("/domainlists", status_code=303)
 
 
 @router.post("/iplists/new")

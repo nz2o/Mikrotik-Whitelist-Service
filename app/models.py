@@ -85,6 +85,55 @@ class IpList(_StandardMixin, Base):
 
 
 # ---------------------------------------------------------------------------
+# domainLists
+# ---------------------------------------------------------------------------
+
+
+class DomainList(_StandardMixin, Base):
+    __tablename__ = "domainLists"
+    __table_args__ = (
+        Index("ix_domainLists_flagInactive", "flagInactive"),
+        {"schema": SCHEMA},
+    )
+
+    url = Column(Text, nullable=True)
+    flagUserDefined = Column(SmallInteger, nullable=False, default=0)
+    # Keep semantics aligned with IpList TYPE_* constants.
+    listType = Column(SmallInteger, nullable=False, default=IpList.TYPE_ALLOW)
+    description = Column(Text, nullable=True)
+    comment = Column(Text, nullable=True)
+    lastSync = Column(DateTime(timezone=True), nullable=True)
+    fetchFrequencyHours = Column(Integer, nullable=False, default=0)
+    ttlDays = Column(Integer, nullable=True)
+
+    domains = relationship(
+        "Domain", back_populates="domainList", cascade="all, delete-orphan"
+    )
+
+
+# ---------------------------------------------------------------------------
+# domains
+# ---------------------------------------------------------------------------
+
+
+class Domain(_StandardMixin, Base):
+    __tablename__ = "domains"
+    __table_args__ = (
+        Index("ix_domains_flagInactive", "flagInactive"),
+        Index("ix_domains_domainListsId_flagInactive", "domainListsId", "flagInactive"),
+        {"schema": SCHEMA},
+    )
+
+    domainName = Column(Text, nullable=False)
+    ipAddress = Column(Text, nullable=False)
+    domainListsId = Column(
+        BigInteger, ForeignKey(f"{SCHEMA}.domainLists.id", ondelete="CASCADE"), nullable=False
+    )
+
+    domainList = relationship("DomainList", back_populates="domains")
+
+
+# ---------------------------------------------------------------------------
 # ipAddresses
 # ---------------------------------------------------------------------------
 

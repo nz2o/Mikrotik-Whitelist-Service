@@ -10,7 +10,11 @@ Responsibilities:
 import ipaddress
 import logging
 import os
+import re
+import socket
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -24,9 +28,13 @@ from app.config import (
     configure_logging,
 )
 from app.database import SessionLocal
-from app.models import FetchError, FetchJob, IpAddress, IpList
+from app.models import Domain, DomainList, FetchError, FetchJob, IpAddress, IpList
 
 log = logging.getLogger(__name__)
+
+DOMAIN_RESOLVE_WORKERS = max(8, min(32, (os.cpu_count() or 4) * 4))
+_DOMAIN_FETCH_STATUS_LOCK = threading.Lock()
+_DOMAIN_FETCH_STATUS: dict[int, dict[str, object]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +66,62 @@ def _parse_lines(lines: list[str]) -> tuple[list[str], int]:
         except ValueError:
             log.warning("Skipping malformed IP/CIDR entry", extra={"entry": line})
     return valid, parsed
+
+
+_DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?)(\.[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?)+$")
+
+
+def _parse_domain_lines(lines: list[str]) -> tuple[list[str], int]:
+    """Return (valid_domains, total_parsed_count)."""
+    valid: list[str] = []
+    parsed = 0
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or line.startswith(";"):
+            continue
+        parsed += 1
+        line = line.split("#")[0].split(";")[0].strip().lower().rstrip(".")
+        if not line:
+            continue
+        if _DOMAIN_RE.match(line):
+            valid.append(line)
+        else:
+            log.warning("Skipping malformed domain entry", extra={"entry": line})
+    return valid, parsed
+
+
+def _resolve_domain_ipv4(domain: str) -> list[str]:
+    """Resolve all A records for a domain name."""
+    results: set[str] = set()
+    try:
+        infos = socket.getaddrinfo(domain, None, family=socket.AF_INET, type=socket.SOCK_STREAM)
+        for info in infos:
+            addr = info[4][0]
+            results.add(str(ipaddress.IPv4Address(addr)))
+    except Exception as exc:
+        log.warning("DNS resolution failed", extra={"domain": domain, "error": str(exc)})
+    return sorted(results)
+
+
+def _update_domain_fetch_status(domain_list_id: int, **updates) -> None:
+    with _DOMAIN_FETCH_STATUS_LOCK:
+        current = dict(_DOMAIN_FETCH_STATUS.get(domain_list_id, {}))
+        current.update(updates)
+        _DOMAIN_FETCH_STATUS[domain_list_id] = current
+
+
+def get_domain_fetch_status(domain_list_id: int) -> dict[str, object]:
+    with _DOMAIN_FETCH_STATUS_LOCK:
+        return dict(_DOMAIN_FETCH_STATUS.get(domain_list_id, {}))
+
+
+def trigger_domain_fetch_async(domain_list_id: int) -> bool:
+    with _DOMAIN_FETCH_STATUS_LOCK:
+        current = _DOMAIN_FETCH_STATUS.get(domain_list_id, {})
+        if current.get("active"):
+            return False
+    threading.Thread(target=fetch_domain_list, args=[domain_list_id], daemon=True).start()
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +242,205 @@ def fetch_all() -> None:
         fetch_list(iplist_id)
 
 
+def fetch_domain_list(domain_list_id: int) -> None:
+    """Fetch and resolve a single domain list."""
+    with _DOMAIN_FETCH_STATUS_LOCK:
+        current = _DOMAIN_FETCH_STATUS.get(domain_list_id, {})
+        if current.get("active"):
+            log.info("Domain fetch already running", extra={"domainListsId": domain_list_id})
+            return
+        _DOMAIN_FETCH_STATUS[domain_list_id] = {
+            "domainListsId": domain_list_id,
+            "active": True,
+            "status": "starting",
+            "startedAt": datetime.now(timezone.utc).isoformat(),
+            "finishedAt": None,
+            "parsedDomains": 0,
+            "totalDomains": 0,
+            "processedDomains": 0,
+            "resolvedRows": 0,
+            "lastError": None,
+        }
+
+    db = SessionLocal()
+    try:
+        dlist = db.query(DomainList).filter(DomainList.id == domain_list_id).first()
+        if not dlist:
+            log.error("domain list not found", extra={"domainListsId": domain_list_id})
+            _update_domain_fetch_status(
+                domain_list_id,
+                active=False,
+                status="failed",
+                finishedAt=datetime.now(timezone.utc).isoformat(),
+                lastError="domain list not found",
+            )
+            return
+        if dlist.flagInactive == 1:
+            log.info("Skipping inactive domain list", extra={"domainListsId": domain_list_id})
+            _update_domain_fetch_status(
+                domain_list_id,
+                active=False,
+                status="skipped",
+                finishedAt=datetime.now(timezone.utc).isoformat(),
+                lastError="inactive domain list",
+            )
+            return
+        if dlist.flagUserDefined == 1:
+            log.info("Skipping user-defined domain list", extra={"domainListsId": domain_list_id})
+            _update_domain_fetch_status(
+                domain_list_id,
+                active=False,
+                status="skipped",
+                finishedAt=datetime.now(timezone.utc).isoformat(),
+                lastError="user-defined domain list",
+            )
+            return
+        if not dlist.url:
+            log.info("Skipping domain list with no URL", extra={"domainListsId": domain_list_id})
+            _update_domain_fetch_status(
+                domain_list_id,
+                active=False,
+                status="failed",
+                finishedAt=datetime.now(timezone.utc).isoformat(),
+                lastError="domain list URL is empty",
+            )
+            return
+
+        raw_path = Path(RAWIPLISTS_DIR) / f"domain_{domain_list_id}.list"
+        _update_domain_fetch_status(domain_list_id, status="fetching")
+
+        last_error: str | None = None
+        downloaded = False
+        for attempt in range(1, FETCH_RETRIES + 1):
+            try:
+                with httpx.Client(timeout=FETCH_TIMEOUT_SECONDS, follow_redirects=True) as client:
+                    resp = client.get(dlist.url)
+                    resp.raise_for_status()
+                raw_path.parent.mkdir(parents=True, exist_ok=True)
+                raw_path.write_bytes(resp.content)
+                downloaded = True
+                break
+            except Exception as exc:
+                last_error = str(exc)
+                log.warning(
+                    "Domain fetch attempt failed",
+                    extra={"domainListsId": domain_list_id, "attempt": attempt, "error": last_error},
+                )
+                if attempt < FETCH_RETRIES:
+                    time.sleep(2 ** attempt)
+
+        if not downloaded:
+            log.error(
+                "Domain fetch failed",
+                extra={"domainListsId": domain_list_id, "error": last_error},
+            )
+            _update_domain_fetch_status(
+                domain_list_id,
+                active=False,
+                status="failed",
+                finishedAt=datetime.now(timezone.utc).isoformat(),
+                lastError=last_error,
+            )
+            return
+
+        lines = raw_path.read_text(errors="replace").splitlines()
+        domains, parsed_count = _parse_domain_lines(lines)
+        domains = list(dict.fromkeys(domains))
+        _update_domain_fetch_status(
+            domain_list_id,
+            status="resolving",
+            parsedDomains=parsed_count,
+            totalDomains=len(domains),
+            processedDomains=0,
+            resolvedRows=0,
+            lastError=None,
+        )
+
+        log.info(
+            "Domain fetch started",
+            extra={
+                "domainListsId": domain_list_id,
+                "url": dlist.url,
+                "domainsParsed": parsed_count,
+                "uniqueDomains": len(domains),
+            },
+        )
+
+        resolved_rows: list[dict[str, object]] = []
+        processed_domains = 0
+        with ThreadPoolExecutor(max_workers=DOMAIN_RESOLVE_WORKERS) as executor:
+            futures = {executor.submit(_resolve_domain_ipv4, domain): domain for domain in domains}
+            for future in as_completed(futures):
+                domain = futures[future]
+                ips = future.result()
+                processed_domains += 1
+                for ip in ips:
+                    resolved_rows.append(
+                        {
+                            "domainName": domain,
+                            "ipAddress": ip,
+                            "domainListsId": domain_list_id,
+                        }
+                    )
+                if processed_domains == len(domains) or processed_domains % 250 == 0:
+                    _update_domain_fetch_status(
+                        domain_list_id,
+                        processedDomains=processed_domains,
+                        resolvedRows=len(resolved_rows),
+                    )
+
+        db.query(Domain).filter(Domain.domainListsId == domain_list_id).delete()
+        if resolved_rows:
+            db.bulk_insert_mappings(Domain, resolved_rows)
+        dlist.lastSync = datetime.now(timezone.utc)
+        db.commit()
+        _update_domain_fetch_status(
+            domain_list_id,
+            active=False,
+            status="complete",
+            finishedAt=datetime.now(timezone.utc).isoformat(),
+            processedDomains=len(domains),
+            resolvedRows=len(resolved_rows),
+            lastError=None,
+        )
+        log.info(
+            "Domain fetch complete",
+            extra={
+                "domainListsId": domain_list_id,
+                "url": dlist.url,
+                "domainsParsed": parsed_count,
+                "resolvedRows": len(resolved_rows),
+            },
+        )
+    except Exception as exc:
+        _update_domain_fetch_status(
+            domain_list_id,
+            active=False,
+            status="failed",
+            finishedAt=datetime.now(timezone.utc).isoformat(),
+            lastError=str(exc),
+        )
+        raise
+    finally:
+        db.close()
+
+
+def fetch_all_domain_lists() -> None:
+    """Trigger an immediate fetch of all active downloaded domain lists."""
+    db = SessionLocal()
+    try:
+        ids = [
+            row.id
+            for row in db.query(DomainList.id)
+            .filter(DomainList.flagInactive == 0, DomainList.flagUserDefined == 0)
+            .all()
+        ]
+    finally:
+        db.close()
+    for domain_list_id in ids:
+        fetch_domain_list(domain_list_id)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -206,6 +469,7 @@ def _fail_job(db, job_id: int, iplist_id: int, error: str) -> None:
 
 _scheduler = BackgroundScheduler()
 _scheduled_ids: dict[int, str] = {}  # iplist_id -> APScheduler job id
+_domain_scheduled_ids: dict[int, str] = {}  # domain_list_id -> APScheduler job id
 
 
 def _sync_schedule() -> None:
@@ -255,6 +519,55 @@ def _sync_schedule() -> None:
             log.info(
                 "Rescheduled fetch",
                 extra={"iplistsId": update_id, "hours": desired[update_id]},
+            )
+
+
+def _sync_domain_schedule() -> None:
+    """Re-read DB and adjust scheduled jobs for domain lists."""
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(DomainList.id, DomainList.fetchFrequencyHours)
+            .filter(
+                DomainList.flagInactive == 0,
+                DomainList.flagUserDefined == 0,
+                DomainList.fetchFrequencyHours > 0,
+            )
+            .all()
+        )
+    finally:
+        db.close()
+
+    desired: dict[int, int] = {r.id: r.fetchFrequencyHours for r in rows}
+    current_ids = set(_domain_scheduled_ids.keys())
+    desired_ids = set(desired.keys())
+
+    for remove_id in current_ids - desired_ids:
+        _scheduler.remove_job(_domain_scheduled_ids.pop(remove_id))
+        log.info("Removed domain fetch schedule", extra={"domainListsId": remove_id})
+
+    for add_id in desired_ids - current_ids:
+        hours = desired[add_id]
+        job = _scheduler.add_job(
+            fetch_domain_list,
+            "interval",
+            hours=hours,
+            args=[add_id],
+            id=f"domain_fetch_{add_id}",
+            replace_existing=True,
+        )
+        _domain_scheduled_ids[add_id] = job.id
+        log.info("Added domain fetch schedule", extra={"domainListsId": add_id, "hours": hours})
+
+    for update_id in current_ids & desired_ids:
+        job = _scheduler.get_job(_domain_scheduled_ids[update_id])
+        if job and job.trigger.interval.total_seconds() != desired[update_id] * 3600:
+            _scheduler.reschedule_job(
+                _domain_scheduled_ids[update_id], trigger="interval", hours=desired[update_id]
+            )
+            log.info(
+                "Rescheduled domain fetch",
+                extra={"domainListsId": update_id, "hours": desired[update_id]},
             )
 
 
@@ -316,15 +629,49 @@ def _run_catchup_fetches() -> None:
         db.close()
 
 
+def _run_domain_catchup_fetches() -> None:
+    """Run one-off catch-up fetches for overdue domain lists."""
+    now = datetime.now(timezone.utc)
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(DomainList.id, DomainList.fetchFrequencyHours, DomainList.lastSync)
+            .filter(
+                DomainList.flagInactive == 0,
+                DomainList.flagUserDefined == 0,
+                DomainList.fetchFrequencyHours > 0,
+            )
+            .all()
+        )
+        for row in rows:
+            overdue = (
+                row.lastSync is None
+                or (now - row.lastSync).total_seconds() >= row.fetchFrequencyHours * 3600
+            )
+            if overdue:
+                log.info(
+                    "Running catch-up fetch for overdue domain list",
+                    extra={"domainListsId": row.id, "hours": row.fetchFrequencyHours},
+                )
+                fetch_domain_list(row.id)
+    finally:
+        db.close()
+
+
 def _schedule_check() -> None:
     if _is_fetcher_enabled():
         _sync_schedule()
+        _sync_domain_schedule()
         _run_catchup_fetches()
+        _run_domain_catchup_fetches()
     else:
         # Pause all jobs when fetcher is disabled
         for iplist_id, job_id in list(_scheduled_ids.items()):
             _scheduler.remove_job(job_id)
             del _scheduled_ids[iplist_id]
+        for domain_list_id, job_id in list(_domain_scheduled_ids.items()):
+            _scheduler.remove_job(job_id)
+            del _domain_scheduled_ids[domain_list_id]
 
 
 def run() -> None:

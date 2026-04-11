@@ -30,6 +30,36 @@ def trigger_fetch_one(iplist_id: int):
     return {"status": "triggered", "iplistsId": iplist_id}
 
 
+@router.post("/fetch-domains/all")
+def trigger_domain_fetch_all():
+    """Trigger an immediate fetch of all active domain lists."""
+    _run_bg(fetcher_svc.fetch_all_domain_lists)
+    return {"status": "triggered", "target": "all-domain-lists"}
+
+
+@router.post("/fetch-domains/{domain_list_id}")
+def trigger_domain_fetch_one(domain_list_id: int):
+    """Trigger an immediate fetch of a specific domain list."""
+    started = fetcher_svc.trigger_domain_fetch_async(domain_list_id)
+    return {
+        "status": "triggered" if started else "already-running",
+        "domainListsId": domain_list_id,
+    }
+
+
+@router.get("/fetch-domains/{domain_list_id}/status")
+def get_domain_fetch_status(domain_list_id: int):
+    """Return the in-process status for a manually triggered domain fetch."""
+    status = fetcher_svc.get_domain_fetch_status(domain_list_id)
+    if not status:
+        return {
+            "domainListsId": domain_list_id,
+            "active": False,
+            "status": "idle",
+        }
+    return status
+
+
 @router.post("/apply/all")
 def trigger_apply_all():
     """Trigger an immediate apply to all active firewalls (bypasses idempotency)."""
@@ -40,5 +70,21 @@ def trigger_apply_all():
 @router.post("/apply/{firewall_id}")
 def trigger_apply_one(firewall_id: int):
     """Trigger an immediate apply to a specific firewall (bypasses idempotency)."""
-    _run_bg(applicator_svc.apply_firewall, firewall_id, True)
-    return {"status": "triggered", "firewallsId": firewall_id}
+    started = applicator_svc.trigger_apply_async(firewall_id, True)
+    return {
+        "status": "triggered" if started else "already-running",
+        "firewallsId": firewall_id,
+    }
+
+
+@router.get("/apply/{firewall_id}/status")
+def get_apply_status(firewall_id: int):
+    """Return the in-process status for a manual firewall apply."""
+    status = applicator_svc.get_apply_status(firewall_id)
+    if not status:
+        return {
+            "firewallsId": firewall_id,
+            "active": False,
+            "status": "idle",
+        }
+    return status

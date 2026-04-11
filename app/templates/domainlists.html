@@ -1,0 +1,374 @@
+{% extends "base.html" %}
+{% block title %}Domain Lists — Mikrotik Whitelist Service{% endblock %}
+{% block content %}
+<div class="d-flex align-items-center justify-content-between mb-3">
+  <h4 class="mb-0"><i class="bi bi-globe2 me-2"></i>Domain Lists</h4>
+  <div class="d-flex gap-2">
+    <button class="btn btn-outline-secondary btn-sm" onclick="triggerDomainFetchAll(this)">
+      <i class="bi bi-arrow-clockwise me-1"></i>Fetch All Domains
+    </button>
+    <button class="btn btn-primary btn-sm" data-bs-toggle="modal" data-bs-target="#addDomainListModal">
+      <i class="bi bi-plus-lg me-1"></i>Add New
+    </button>
+  </div>
+</div>
+
+<div class="alert alert-info py-2">
+  <i class="bi bi-info-circle me-2"></i>
+  Each fetched domain is resolved to IPv4 A records and those IPs are merged into combined exports/apply by list type.
+</div>
+
+<div id="domain-fetch-feedback" class="alert d-none py-2" role="alert"></div>
+
+<div class="table-responsive">
+<table class="table table-hover table-bordered bg-white shadow-sm rounded">
+  <thead class="table-dark">
+    <tr>
+      <th>ID</th>
+      <th>Source</th>
+      <th>URL</th>
+      <th>Type</th>
+      <th>Description</th>
+      <th>Comment</th>
+      <th>Freq (h)</th>
+      <th>TTL (days)</th>
+      <th>Resolved IPs</th>
+      <th>Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for row in domain_lists %}
+  <tr>
+    <form id="domain-list-form-{{ row.id }}" method="post" action="/domainlists/{{ row.id }}/save">
+    <td class="text-muted small">{{ row.id }}</td>
+    <td>
+      <select name="flagUserDefined" class="form-select form-select-sm" style="min-width:130px">
+        <option value="0" {% if row.flagUserDefined == 0 %}selected{% endif %}>Downloaded</option>
+        <option value="1" {% if row.flagUserDefined == 1 %}selected{% endif %}>User Defined</option>
+      </select>
+    </td>
+    <td>
+      <input name="url" class="form-control form-control-sm" value="{{ row.url or '' }}"
+             {% if row.flagUserDefined == 1 %}placeholder="No URL — managed manually"{% endif %}
+             style="min-width:260px">
+    </td>
+    <td>
+      <select name="listType" class="form-select form-select-sm" style="min-width:150px">
+        {% for code, label in list_type_options %}
+        <option value="{{ code }}" {% if row.listType == code %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </td>
+    <td><input name="description" class="form-control form-control-sm" value="{{ row.description or '' }}" style="min-width:180px"></td>
+    <td><input name="comment" class="form-control form-control-sm" value="{{ row.comment or '' }}" style="min-width:160px"></td>
+    <td><input name="fetchFrequencyHours" type="number" min="0" class="form-control form-control-sm" value="{{ row.fetchFrequencyHours }}" style="width:75px"></td>
+    <td><input name="ttlDays" type="number" min="1" class="form-control form-control-sm" value="{{ row.ttlDays or '' }}" placeholder="7" style="width:75px"></td>
+    <td>
+      <span class="badge bg-secondary">{{ resolved_counts.get(row.id, 0) }} IPs</span>
+    </td>
+    <td>
+      <div class="d-flex gap-1">
+        <button type="submit" class="btn btn-sm btn-outline-primary" title="Save">
+          <i class="bi bi-floppy"></i>
+        </button>
+    </form>
+        {% if row.flagUserDefined == 0 %}
+        <button class="btn btn-sm btn-outline-secondary" title="Fetch Now"
+          data-domain-list-id="{{ row.id }}"
+          onclick="triggerDomainFetchButton(this)">
+          <i class="bi bi-arrow-clockwise"></i>
+        </button>
+        {% endif %}
+        <form method="post" action="/domainlists/{{ row.id }}/delete"
+              onsubmit="return confirm('Delete domain list {{ row.id }} and all resolved rows?')">
+          <button type="submit" class="btn btn-sm btn-outline-danger" title="Delete">
+            <i class="bi bi-trash"></i>
+          </button>
+        </form>
+      </div>
+    </td>
+  </tr>
+  <tr>
+    <td colspan="10" class="bg-body-tertiary">
+      <div class="d-flex flex-wrap gap-3 align-items-center small">
+        <div class="form-check m-0">
+          <input name="flagInactive" type="checkbox" class="form-check-input" value="1"
+                 form="domain-list-form-{{ row.id }}" id="domain-list-inactive-{{ row.id }}"
+                 {% if row.flagInactive == 1 %}checked{% endif %}>
+          <label class="form-check-label" for="domain-list-inactive-{{ row.id }}">Inactive</label>
+        </div>
+        <span class="text-muted">Last Sync: {{ row.lastSync.strftime('%Y-%m-%d %H:%M:%S') if row.lastSync else '—' }}</span>
+        <span class="text-muted" id="domain-fetch-status-{{ row.id }}"></span>
+        <span class="text-muted">Created: {{ row.createDate.strftime('%Y-%m-%d %H:%M:%S') }}</span>
+        <span class="text-muted">Updated: {{ row.updateDate.strftime('%Y-%m-%d %H:%M:%S') }}</span>
+      </div>
+    </td>
+  </tr>
+  {% else %}
+  <tr><td colspan="10" class="text-center text-muted py-3">No domain lists configured yet.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+
+<div class="modal fade" id="addDomainListModal" tabindex="-1">
+  <div class="modal-dialog modal-lg">
+    <form method="post" action="/domainlists/new">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">Add New Domain List</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body row g-3">
+          <div class="col-md-4">
+            <label class="form-label">Source</label>
+            <select name="flagUserDefined" class="form-select" id="newDomainListSource" onchange="toggleNewDomainListSource(this.value)">
+              <option value="0">Downloaded URL</option>
+              <option value="1">User Defined</option>
+            </select>
+          </div>
+          <div class="col-12">
+            <label class="form-label">URL <span class="text-danger" id="newDomainUrlRequired">*</span></label>
+            <input name="url" type="url" class="form-control" id="newDomainListUrl" required placeholder="https://example.com/domain-list.txt">
+            <div class="form-text" id="newDomainListUrlHelp">Required for downloaded lists. Leave blank for user-defined lists.</div>
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">Type</label>
+            <select name="listType" class="form-select">
+              {% for code, label in list_type_options %}
+              <option value="{{ code }}" {% if code == 0 %}selected{% endif %}>{{ label }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">Fetch Frequency (hours)</label>
+            <input name="fetchFrequencyHours" type="number" min="0" class="form-control" id="newDomainFetchFrequencyHours" value="24">
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">TTL (days)</label>
+            <input name="ttlDays" type="number" min="1" class="form-control" placeholder="7 (default)">
+          </div>
+          <div class="col-md-6">
+            <label class="form-label">Description</label>
+            <input name="description" class="form-control" placeholder="Domain IOC feed">
+          </div>
+          <div class="col-md-6">
+            <label class="form-label">Comment</label>
+            <input name="comment" class="form-control" placeholder="A records are resolved and merged into exports">
+          </div>
+          <div class="col-md-4 d-flex align-items-end">
+            <div class="form-check">
+              <input name="flagInactive" type="checkbox" class="form-check-input" value="1" id="newDomainListInactive">
+              <label class="form-check-label" for="newDomainListInactive">Inactive</label>
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="newDomainListSubmitLabel">Add &amp; Fetch</button>
+        </div>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const activeDomainFetchPollers = new Map();
+
+function showDomainFetchFeedback(level, message) {
+  const box = document.getElementById('domain-fetch-feedback');
+  if (!box) {
+    return;
+  }
+  box.className = `alert alert-${level} py-2`;
+  box.textContent = message;
+}
+
+function updateDomainFetchStatusLine(id, message) {
+  const el = document.getElementById(`domain-fetch-status-${id}`);
+  if (el) {
+    el.textContent = message;
+  }
+}
+
+function stopDomainFetchPolling(id) {
+  const timer = activeDomainFetchPollers.get(String(id));
+  if (timer) {
+    clearTimeout(timer);
+    activeDomainFetchPollers.delete(String(id));
+  }
+}
+
+function scheduleDomainFetchPoll(id, delayMs) {
+  stopDomainFetchPolling(id);
+  const timer = setTimeout(() => pollDomainFetchStatus(id), delayMs);
+  activeDomainFetchPollers.set(String(id), timer);
+}
+
+function pollDomainFetchStatus(id) {
+  fetch(`/internal/fetch-domains/${id}/status`)
+    .then((response) => response.json())
+    .then((data) => {
+      if (data.active) {
+        const total = data.totalDomains || 0;
+        const processed = data.processedDomains || 0;
+        const resolved = data.resolvedRows || 0;
+        let message = 'Fetch queued';
+        if (data.status === 'fetching') {
+          message = 'Fetching source file...';
+        } else if (data.status === 'resolving') {
+          message = `Resolving domains: ${processed}/${total} processed, ${resolved} IPs found`;
+        } else if (data.status === 'starting') {
+          message = 'Starting fetch...';
+        }
+        updateDomainFetchStatusLine(id, message);
+        showDomainFetchFeedback('info', `Domain List ${id}: ${message}`);
+        scheduleDomainFetchPoll(id, 2000);
+        return;
+      }
+
+      if (data.status === 'complete') {
+        updateDomainFetchStatusLine(id, `Completed: ${data.resolvedRows || 0} IPs resolved`);
+        showDomainFetchFeedback('success', `Domain List ${id} fetch completed. Refreshing results...`);
+        stopDomainFetchPolling(id);
+        setTimeout(() => window.location.reload(), 1200);
+        return;
+      }
+
+      if (data.status === 'failed') {
+        const error = data.lastError || 'fetch failed';
+        updateDomainFetchStatusLine(id, `Failed: ${error}`);
+        showDomainFetchFeedback('danger', `Domain List ${id} fetch failed: ${error}`);
+        stopDomainFetchPolling(id);
+        return;
+      }
+
+      if (data.status === 'skipped') {
+        updateDomainFetchStatusLine(id, data.lastError || 'Skipped');
+        showDomainFetchFeedback('warning', `Domain List ${id}: ${data.lastError || 'Skipped'}`);
+        stopDomainFetchPolling(id);
+        return;
+      }
+
+      updateDomainFetchStatusLine(id, '');
+      stopDomainFetchPolling(id);
+    })
+    .catch(() => {
+      showDomainFetchFeedback('danger', `Unable to read fetch status for Domain List ${id}.`);
+      stopDomainFetchPolling(id);
+    });
+}
+
+function triggerDomainFetch(id, btn) {
+  btn.disabled = true;
+  const originalHtml = btn.innerHTML;
+  btn.innerHTML = '<i class="bi bi-hourglass-split"></i>';
+  fetch(`/internal/fetch-domains/${id}`, {method: 'POST'})
+    .then((response) => response.json())
+    .then((data) => {
+      if (data.status === 'already-running') {
+        showDomainFetchFeedback('info', `Domain List ${id} is already fetching.`);
+      } else {
+        showDomainFetchFeedback('info', `Domain List ${id} fetch started. Large lists can take several minutes.`);
+      }
+      pollDomainFetchStatus(id);
+    })
+    .catch(() => {
+      showDomainFetchFeedback('danger', `Unable to start fetch for Domain List ${id}.`);
+    })
+    .finally(() => {
+      btn.disabled = false;
+      btn.innerHTML = originalHtml;
+    });
+}
+
+function triggerDomainFetchButton(btn) {
+  const id = btn.getAttribute('data-domain-list-id');
+  if (!id) {
+    return;
+  }
+  triggerDomainFetch(id, btn);
+}
+
+function triggerDomainFetchAll(btn) {
+  btn.disabled = true;
+  btn.innerHTML = '<i class="bi bi-hourglass-split me-1"></i>Fetching…';
+  fetch('/internal/fetch-domains/all', {method: 'POST'})
+    .finally(() => { btn.disabled = false; btn.innerHTML = '<i class="bi bi-arrow-clockwise me-1"></i>Fetch All Domains'; });
+}
+
+function toggleNewDomainListSource(value) {
+  const urlInput = document.getElementById('newDomainListUrl');
+  const freqInput = document.getElementById('newDomainFetchFrequencyHours');
+  const requiredMark = document.getElementById('newDomainUrlRequired');
+  const submitButton = document.getElementById('newDomainListSubmitLabel');
+  const urlHelp = document.getElementById('newDomainListUrlHelp');
+
+  if (!urlInput || !freqInput || !requiredMark || !submitButton) {
+    return;
+  }
+
+  if (value === '1') {
+    urlInput.required = false;
+    urlInput.setAttribute('readonly', 'readonly');
+    urlInput.setAttribute('disabled', 'disabled');
+    urlInput.value = '';
+    urlInput.placeholder = 'No URL needed for user-defined lists';
+    urlInput.classList.add('bg-secondary-subtle');
+    freqInput.value = 0;
+    freqInput.setAttribute('readonly', 'readonly');
+    freqInput.setAttribute('disabled', 'disabled');
+    freqInput.classList.add('bg-secondary-subtle');
+    requiredMark.classList.add('d-none');
+    if (urlHelp) {
+      urlHelp.textContent = 'User-defined lists are not auto-fetched.';
+    }
+    submitButton.textContent = 'Add Manual List';
+  } else {
+    urlInput.required = true;
+    urlInput.removeAttribute('readonly');
+    urlInput.removeAttribute('disabled');
+    urlInput.placeholder = 'https://example.com/domain-list.txt';
+    urlInput.classList.remove('bg-secondary-subtle');
+    freqInput.removeAttribute('readonly');
+    freqInput.removeAttribute('disabled');
+    freqInput.classList.remove('bg-secondary-subtle');
+    if (freqInput.value === '0') {
+      freqInput.value = 24;
+    }
+    requiredMark.classList.remove('d-none');
+    if (urlHelp) {
+      urlHelp.textContent = 'Required for downloaded lists. Leave blank for user-defined lists.';
+    }
+    submitButton.textContent = 'Add & Fetch';
+  }
+}
+
+document.addEventListener('DOMContentLoaded', function () {
+  const sourceSelect = document.getElementById('newDomainListSource');
+  const modal = document.getElementById('addDomainListModal');
+  const searchParams = new URLSearchParams(window.location.search);
+  const fetchStartedId = searchParams.get('fetchStarted');
+
+  if (sourceSelect) {
+    toggleNewDomainListSource(sourceSelect.value);
+    sourceSelect.addEventListener('change', function () {
+      toggleNewDomainListSource(this.value);
+    });
+  }
+
+  if (modal && sourceSelect) {
+    modal.addEventListener('shown.bs.modal', function () {
+      toggleNewDomainListSource(sourceSelect.value);
+    });
+  }
+
+  if (fetchStartedId) {
+    showDomainFetchFeedback('info', `Domain List ${fetchStartedId} fetch started after save. Large lists can take several minutes.`);
+    pollDomainFetchStatus(fetchStartedId);
+  }
+});
+</script>
+{% endblock %}
