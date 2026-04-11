@@ -272,9 +272,54 @@ def _is_fetcher_enabled() -> bool:
         db.close()
 
 
+def _run_catchup_fetches() -> None:
+    """Run one-off catch-up fetches for overdue lists.
+
+    This protects against missed interval executions (container restarts, scheduler
+    hiccups, clock drift). If a list is overdue and not currently in an active
+    fetch state, trigger a fetch immediately.
+    """
+    now = datetime.now(timezone.utc)
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(IpList.id, IpList.fetchFrequencyHours, IpList.lastSync)
+            .filter(
+                IpList.flagInactive == 0,
+                IpList.flagUserDefined == 0,
+                IpList.fetchFrequencyHours > 0,
+            )
+            .all()
+        )
+
+        for row in rows:
+            latest_job = (
+                db.query(FetchJob.status)
+                .filter(FetchJob.iplistsId == row.id)
+                .order_by(FetchJob.startedAt.desc())
+                .first()
+            )
+            if latest_job and latest_job.status in {"pending", "fetching", "parsing", "loading"}:
+                continue
+
+            overdue = (
+                row.lastSync is None
+                or (now - row.lastSync).total_seconds() >= row.fetchFrequencyHours * 3600
+            )
+            if overdue:
+                log.info(
+                    "Running catch-up fetch for overdue list",
+                    extra={"iplistsId": row.id, "hours": row.fetchFrequencyHours},
+                )
+                fetch_list(row.id)
+    finally:
+        db.close()
+
+
 def _schedule_check() -> None:
     if _is_fetcher_enabled():
         _sync_schedule()
+        _run_catchup_fetches()
     else:
         # Pause all jobs when fetcher is disabled
         for iplist_id, job_id in list(_scheduled_ids.items()):
@@ -287,6 +332,9 @@ def run() -> None:
     configure_logging()
     log.info("Fetcher service starting")
     Path(RAWIPLISTS_DIR).mkdir(parents=True, exist_ok=True)
+
+    # Apply current schedule immediately at startup, without waiting 60s.
+    _schedule_check()
 
     # Check schedule every 60 seconds
     _scheduler.add_job(_schedule_check, "interval", seconds=60, id="schedule_check")

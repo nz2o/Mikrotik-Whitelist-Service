@@ -1,0 +1,65 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "restart-fetcher",
+			"type": "shell",
+			"command": "docker compose up -d --build fetcher",
+			"isBackground": false
+		},
+		{
+			"label": "compose-ps",
+			"type": "shell",
+			"command": "docker compose ps",
+			"isBackground": false
+		},
+		{
+			"label": "fetcher-logs-tail",
+			"type": "shell",
+			"command": "docker logs --since 15m --tail 200 mikrotik-whitelist-service-fetcher-1",
+			"isBackground": false
+		},
+		{
+			"label": "check-fetcher-config",
+			"type": "shell",
+			"command": "docker compose exec -T postgres psql -X -A -t -U mikrotik -d mikrotik -c \"SELECT \\\"configurationItem\\\", \\\"configurationItemValue\\\" FROM iplist.configuration WHERE \\\"configurationItem\\\" in ('fetcherEnabled','applicatorEnabled') ORDER BY 1;\"",
+			"isBackground": false
+		},
+		{
+			"label": "enable-fetcher",
+			"type": "shell",
+			"command": "docker compose exec -T postgres psql -X -A -t -U mikrotik -d mikrotik -c \"UPDATE iplist.configuration SET \\\"configurationItemValue\\\"='1' WHERE \\\"configurationItem\\\"='fetcherEnabled'; SELECT \\\"configurationItem\\\", \\\"configurationItemValue\\\" FROM iplist.configuration WHERE \\\"configurationItem\\\"='fetcherEnabled';\"",
+			"isBackground": false
+		},
+		{
+			"label": "restart-fetcher-enabled",
+			"type": "shell",
+			"command": "docker compose restart fetcher && docker logs --since 2m --tail 200 mikrotik-whitelist-service-fetcher-1",
+			"isBackground": false
+		},
+		{
+			"label": "compose-ps-after-restart",
+			"type": "shell",
+			"command": "docker compose ps",
+			"isBackground": false
+		},
+		{
+			"label": "fetcher-logs-now",
+			"type": "shell",
+			"command": "docker logs --since 5m --tail 300 mikrotik-whitelist-service-fetcher-1",
+			"isBackground": false
+		},
+		{
+			"label": "check-list2-lastsync",
+			"type": "shell",
+			"command": "curl -s http://127.0.0.1:8000/iplists | grep -n \"Last Sync:\\|/iplists/2/save\" | head -20",
+			"isBackground": false
+		},
+		{
+			"label": "git-status-fetcher-fix",
+			"type": "shell",
+			"command": "git status --short",
+			"isBackground": false
+		}
+	]
+}

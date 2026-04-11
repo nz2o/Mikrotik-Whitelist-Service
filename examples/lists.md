@@ -17,7 +17,7 @@ This file contains commonly used IPv4/CIDR feeds that can be used with this serv
 
 Use these to allow traffic from specific countries.
 
-- US: https://www.ipdeny.com/ipblocks/data/countries/us.zone
+- US: https://www.ipdeny.com/ipblocks/data/aggregated/us-aggregated.zone
 - CA: https://www.ipdeny.com/ipblocks/data/countries/ca.zone
 - GB: https://www.ipdeny.com/ipblocks/data/countries/gb.zone
 - AU: https://www.ipdeny.com/ipblocks/data/countries/au.zone
