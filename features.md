@@ -41,6 +41,8 @@ Typical use cases:
 
 Domain Lists accept plain exact-match domain feeds. Each fetched domain is resolved to IPv4 A records, and those resolved IPs are merged into the same combined datasets used for router applies and exports.
 
+![Domain Lists](resources/screenshots/domainlists.png)
+
 Typical use cases:
 
 - DNS-over-HTTPS and VPN bypass domains

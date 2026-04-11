@@ -18,6 +18,14 @@ Manage downloadable and manual IPv4/CIDR sources, list types, fetch frequency, a
 
 ---
 
+## Domain Lists
+
+Configure URL-based feeds of domain names. Each domain is resolved to IPv4 A-records and merged into the combined exports/apply by list type.
+
+![Domain Lists](resources/screenshots/domainlists.png)
+
+---
+
 ## Exports
 
 Export combined or per-list results as plain-text or RouterOS scripts.
@@ -40,8 +48,3 @@ Review fetch and apply history, recent outcomes, and operational status.
 
 ![Status and Logs](resources/screenshots/status.png)
 
----
-
-## Current Gap
-
-There is not yet a dedicated screenshot for the Domain Lists page. Once you capture one, it should be added here and linked from [features.md](features.md).
