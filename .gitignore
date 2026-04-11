@@ -135,6 +135,7 @@ venv.bak/
 
 # Project-specific local prompts and tooling artifacts
 **/buildprompt.md
+.vscode/
 
 # Spyder project settings
 .spyderproject
