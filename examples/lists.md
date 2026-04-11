@@ -36,11 +36,12 @@ Tip: Add one country feed per list so you can toggle and monitor them independen
 ### Spamhaus DROP / EDROP
 
 - DROP: https://www.spamhaus.org/drop/drop.txt
-- EDROP: https://www.spamhaus.org/drop/edrop.txt
 
 ### Emerging Threats compromised IPs
 
 - https://rules.emergingthreats.net/blockrules/compromised-ips.txt
+
+Other lists: https://rules.emergingthreats.net/blockrules/
 
 ### Abuse.ch Feodo Tracker IP blocklist
 
@@ -56,7 +57,7 @@ Tip: Add one country feed per list so you can toggle and monitor them independen
 
 ### Basic Geo-Allow + Threat-Deny
 
-1. Allow list: one or more country feeds (for example `us.zone`).
+1. Allow list: one or more country feeds (for example `us.zone`). What is being done here, isn't necessarily a whitelist, but more of a "block if it isn't in this list."
 2. Deny list: Spamhaus DROP + EDROP.
 3. Optional deny list: Emerging Threats compromised IPs.
 
