@@ -14,6 +14,15 @@ A typical use case is allowing only traffic from a specific country (e.g. US-onl
 
 ---
 
+## Why It Exists
+
+- Keep dynamic RouterOS address lists current without manual imports
+- Combine IP-based and domain-derived threat feeds in one workflow
+- Push exact, deduplicated, collapsed list data instead of raw noisy feeds
+- Let MikroTik firewall policy stay in MikroTik while this service manages the data pipeline
+
+---
+
 ## Features
 
 | Feature | Detail |
@@ -58,7 +67,13 @@ Four Docker services:
 
 ## Screenshots And Feature Tour
 
-See [features.md](features.md) for screenshots and a feature walkthrough.
+See [features.md](features.md) for a guided feature walkthrough and [screenshots.md](screenshots.md) for a dedicated screenshot gallery.
+
+Quick preview:
+
+![IP Lists Management](resources/screenshots/iplists.png)
+
+![Firewall Definitions](resources/screenshots/firewalls.png)
 
 ---
 
