@@ -35,6 +35,22 @@ CHUNK_SIZE = 500  # max CIDRs per RouterOS script chunk
 
 
 DEFAULT_TTL_DAYS = 7
+TYPE_TO_KIND = {
+    IpList.TYPE_ALLOW: "allow",
+    IpList.TYPE_DENY: "deny",
+    IpList.TYPE_LOG: "log",
+    IpList.TYPE_OUTBOUND_DENY: "outbound-deny",
+    IpList.TYPE_ALL_DENY: "all-deny",
+}
+KIND_TO_TYPE = {v: k for k, v in TYPE_TO_KIND.items()}
+KIND_TO_TYPE.update({"whitelist": IpList.TYPE_ALLOW, "blacklist": IpList.TYPE_DENY})
+TYPE_TO_LIST_NAME = {
+    IpList.TYPE_ALLOW: "ip-whitelist-dynamic",
+    IpList.TYPE_DENY: "ip-blacklist-dynamic",
+    IpList.TYPE_LOG: "ip-log-dynamic",
+    IpList.TYPE_OUTBOUND_DENY: "ip-outbound-deny-dynamic",
+    IpList.TYPE_ALL_DENY: "ip-all-deny-dynamic",
+}
 
 
 def _consolidate(cidrs: list[str]) -> list[str]:
@@ -49,11 +65,11 @@ def _consolidate(cidrs: list[str]) -> list[str]:
     return [str(n) for n in collapsed]
 
 
-def _build_datasets() -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
-    """Return (whitelist_entries, blacklist_entries) where each entry is (cidr, ttl_days).
+def _build_datasets() -> dict[int, list[tuple[str, int]]]:
+    """Return map of list_type -> [(cidr, ttl_days), ...].
 
     CIDRs are consolidated within each IP list separately so that per-list TTL
-    values are preserved.  Entries from different lists are NOT merged together.
+    values are preserved. Entries from different lists are NOT merged together.
     """
     db = SessionLocal()
     try:
@@ -62,10 +78,12 @@ def _build_datasets() -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
             .filter(IpList.flagInactive == 0)
             .all()
         )
-        whitelist_entries: list[tuple[str, int]] = []
-        blacklist_entries: list[tuple[str, int]] = []
+        datasets: dict[int, list[tuple[str, int]]] = {
+            code: [] for code, _label in IpList.TYPE_OPTIONS
+        }
         for il in active_lists:
             ttl = il.ttlDays if il.ttlDays is not None else DEFAULT_TTL_DAYS
+            list_type = il.flagBlacklist if il.flagBlacklist in datasets else IpList.TYPE_ALLOW
             raw = [
                 r.ipAddress
                 for r in db.query(IpAddress.ipAddress)
@@ -77,14 +95,11 @@ def _build_datasets() -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
             ]
             consolidated = _consolidate(raw)
             entries = [(cidr, ttl) for cidr in consolidated]
-            if il.flagBlacklist == 1:
-                blacklist_entries.extend(entries)
-            else:
-                whitelist_entries.extend(entries)
+            datasets[list_type].extend(entries)
     finally:
         db.close()
 
-    return whitelist_entries, blacklist_entries
+    return datasets
 
 
 def _sha256_of(entries: list[tuple[str, int]]) -> str:
@@ -125,11 +140,9 @@ def _make_rsc_chunks(list_name: str, entries: list[tuple[str, int]]) -> list[str
 
 
 def _kind_to_list_name(kind: str) -> str:
-    if kind == "whitelist":
-        return "ip-whitelist-dynamic"
-    if kind == "blacklist":
-        return "ip-blacklist-dynamic"
-    raise ValueError("kind must be 'whitelist' or 'blacklist'")
+    if kind not in KIND_TO_TYPE:
+        raise ValueError("unsupported kind")
+    return TYPE_TO_LIST_NAME[KIND_TO_TYPE[kind]]
 
 
 def _normalize_ttl(ttl_days: Optional[int]) -> int:
@@ -140,33 +153,27 @@ def _normalize_ttl(ttl_days: Optional[int]) -> int:
     return ttl_days
 
 
-def get_combined_entries() -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
+def get_combined_entries() -> dict[int, list[tuple[str, int]]]:
     """Public helper for export and apply consumers."""
     return _build_datasets()
 
 
 def build_combined_rsc(kind: str) -> str:
-    """Build full RouterOS script for combined whitelist or blacklist."""
-    whitelist, blacklist = get_combined_entries()
-    if kind == "whitelist":
-        entries = whitelist
-    elif kind == "blacklist":
-        entries = blacklist
-    else:
-        raise ValueError("kind must be 'whitelist' or 'blacklist'")
+    """Build full RouterOS script for a combined list type."""
+    datasets = get_combined_entries()
+    if kind not in KIND_TO_TYPE:
+        raise ValueError("unsupported kind")
+    entries = datasets[KIND_TO_TYPE[kind]]
     list_name = _kind_to_list_name(kind)
     return "".join(_make_rsc_chunks(list_name, entries))
 
 
 def build_combined_plain(kind: str) -> str:
-    """Build globally collapsed/de-duplicated CIDR list for combined data."""
-    whitelist, blacklist = get_combined_entries()
-    if kind == "whitelist":
-        entries = whitelist
-    elif kind == "blacklist":
-        entries = blacklist
-    else:
-        raise ValueError("kind must be 'whitelist' or 'blacklist'")
+    """Build globally collapsed/de-duplicated CIDR list for a combined type."""
+    datasets = get_combined_entries()
+    if kind not in KIND_TO_TYPE:
+        raise ValueError("unsupported kind")
+    entries = datasets[KIND_TO_TYPE[kind]]
     collapsed = _consolidate([cidr for cidr, _ttl in entries])
     if not collapsed:
         return ""
@@ -207,7 +214,8 @@ def build_iplist_rsc(iplist_id: int) -> str:
     iplist = _get_iplist_for_export(iplist_id)
     if not iplist:
         raise ValueError("iplist not found")
-    list_name = "ip-blacklist-dynamic" if iplist.flagBlacklist == 1 else "ip-whitelist-dynamic"
+    list_type = iplist.flagBlacklist if iplist.flagBlacklist in TYPE_TO_LIST_NAME else IpList.TYPE_ALLOW
+    list_name = TYPE_TO_LIST_NAME[list_type]
     entries = _get_iplist_entries(iplist_id)
     return "".join(_make_rsc_chunks(list_name, entries))
 
@@ -282,9 +290,15 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
             log.info("Skipping inactive firewall", extra={"firewallsId": firewall_id})
             return
 
-        whitelist, blacklist = _build_datasets()
-        wl_hash = _sha256_of(whitelist)  # includes cidr+ttl in hash
-        bl_hash = _sha256_of(blacklist)
+        datasets = _build_datasets()
+        allow_entries = datasets.get(IpList.TYPE_ALLOW, [])
+        other_entries = []
+        for code, _label in IpList.TYPE_OPTIONS:
+            if code != IpList.TYPE_ALLOW:
+                other_entries.extend(datasets.get(code, []))
+
+        wl_hash = _sha256_of(allow_entries)  # includes cidr+ttl in hash
+        bl_hash = _sha256_of(other_entries)
 
         # Idempotency check (skipped when force=True)
         if not force:
@@ -310,16 +324,18 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
             startedAt=datetime.now(timezone.utc),
             whitelistHash=wl_hash,
             blacklistHash=bl_hash,
-            whitelistCount=len(whitelist),
-            blacklistCount=len(blacklist),
+            whitelistCount=len(allow_entries),
+            blacklistCount=len(other_entries),
         )
         db.add(record)
         db.commit()
         db.refresh(record)
         record_id = record.id
 
-        wl_chunks = _make_rsc_chunks("ip-whitelist-dynamic", whitelist)
-        bl_chunks = _make_rsc_chunks("ip-blacklist-dynamic", blacklist)
+        all_chunks: list[str] = []
+        for code, _label in IpList.TYPE_OPTIONS:
+            list_name = TYPE_TO_LIST_NAME[code]
+            all_chunks.extend(_make_rsc_chunks(list_name, datasets.get(code, [])))
 
         _update_history(db, record_id, status="pushing")
 
@@ -327,7 +343,7 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
         pushed = False
         for attempt in range(1, FETCH_RETRIES + 1):
             try:
-                _push_chunks(fw, wl_chunks + bl_chunks)
+                _push_chunks(fw, all_chunks)
                 pushed = True
                 break
             except Exception as exc:
@@ -350,8 +366,8 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
                 "Apply complete",
                 extra={
                     "firewallsId": firewall_id,
-                    "whitelistCount": len(whitelist),
-                    "blacklistCount": len(blacklist),
+                    "whitelistCount": len(allow_entries),
+                    "blacklistCount": len(other_entries),
                 },
             )
         else:

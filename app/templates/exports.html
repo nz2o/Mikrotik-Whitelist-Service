@@ -12,51 +12,30 @@
 </div>
 
 <div class="row g-3">
+  {% for item in export_types %}
   <div class="col-lg-6">
     <div class="card shadow-sm border-0 h-100">
       <div class="card-header d-flex align-items-center justify-content-between">
-        <span><i class="bi bi-shield-check me-2"></i>Combined Whitelist</span>
-        <span class="badge bg-success">Allow</span>
+        <span><i class="bi bi-diagram-3 me-2"></i>Combined {{ item.label }}</span>
+        <span class="badge {% if item.code == 0 %}bg-success{% elif item.code == 1 %}bg-danger{% elif item.code == 2 %}bg-info text-dark{% elif item.code == 3 %}bg-warning text-dark{% else %}bg-dark{% endif %}">{{ item.label }}</span>
       </div>
       <div class="card-body">
-        <p class="text-muted small mb-3">All active whitelist lists, generated exactly like apply processing.</p>
+        <p class="text-muted small mb-3">All active {{ item.label.lower() }} lists, generated exactly like apply processing.</p>
         <div class="d-grid gap-2">
-          <a class="btn btn-outline-primary" href="/export/combined/whitelist/rsc?download=1">
+          <a class="btn btn-outline-primary" href="/export/combined/{{ item.kind }}/rsc?download=1">
             <i class="bi bi-filetype-rs me-2"></i>Download MikroTik Script (.rsc)
           </a>
-          <a class="btn btn-outline-secondary" href="/export/combined/whitelist/plain?download=1">
+          <a class="btn btn-outline-secondary" href="/export/combined/{{ item.kind }}/plain?download=1">
             <i class="bi bi-file-earmark-text me-2"></i>Download Collapsed CIDR List (.txt)
           </a>
-          <button class="btn btn-outline-dark" onclick="copyExportUrl('/export/combined/whitelist/plain', this)">
+          <button class="btn btn-outline-dark" onclick="copyExportUrl('/export/combined/{{ item.kind }}/plain', this)">
             <i class="bi bi-link-45deg me-2"></i>Copy Plain-List URL
           </button>
         </div>
       </div>
     </div>
   </div>
-
-  <div class="col-lg-6">
-    <div class="card shadow-sm border-0 h-100">
-      <div class="card-header d-flex align-items-center justify-content-between">
-        <span><i class="bi bi-shield-x me-2"></i>Combined Blacklist</span>
-        <span class="badge bg-danger">Deny</span>
-      </div>
-      <div class="card-body">
-        <p class="text-muted small mb-3">All active blacklist lists, generated exactly like apply processing.</p>
-        <div class="d-grid gap-2">
-          <a class="btn btn-outline-primary" href="/export/combined/blacklist/rsc?download=1">
-            <i class="bi bi-filetype-rs me-2"></i>Download MikroTik Script (.rsc)
-          </a>
-          <a class="btn btn-outline-secondary" href="/export/combined/blacklist/plain?download=1">
-            <i class="bi bi-file-earmark-text me-2"></i>Download Collapsed CIDR List (.txt)
-          </a>
-          <button class="btn btn-outline-dark" onclick="copyExportUrl('/export/combined/blacklist/plain', this)">
-            <i class="bi bi-link-45deg me-2"></i>Copy Plain-List URL
-          </button>
-        </div>
-      </div>
-    </div>
-  </div>
+  {% endfor %}
 </div>
 {% endblock %}
 

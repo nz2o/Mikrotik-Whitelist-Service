@@ -53,9 +53,24 @@ class IpList(_StandardMixin, Base):
         {"schema": SCHEMA},
     )
 
+    TYPE_ALLOW = 0
+    TYPE_DENY = 1
+    TYPE_LOG = 2
+    TYPE_OUTBOUND_DENY = 3
+    TYPE_ALL_DENY = 4
+
+    TYPE_OPTIONS = [
+        (TYPE_ALLOW, "Allow"),
+        (TYPE_DENY, "Deny"),
+        (TYPE_LOG, "Log"),
+        (TYPE_OUTBOUND_DENY, "Outbound Deny"),
+        (TYPE_ALL_DENY, "All Deny"),
+    ]
+
     url = Column(Text, nullable=True)
     flagUserDefined = Column(SmallInteger, nullable=False, default=0)
-    flagBlacklist = Column(SmallInteger, nullable=False, default=0)
+    # Legacy name kept for schema compatibility; value now stores IpList TYPE_*.
+    flagBlacklist = Column(SmallInteger, nullable=False, default=TYPE_ALLOW)
     description = Column(Text, nullable=True)
     comment = Column(Text, nullable=True)
     lastSync = Column(DateTime(timezone=True), nullable=True)

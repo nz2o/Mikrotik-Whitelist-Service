@@ -26,6 +26,22 @@ from app.models import (
 router = APIRouter(tags=["ui"])
 templates = Jinja2Templates(directory="app/templates")
 
+LIST_TYPE_OPTIONS = IpList.TYPE_OPTIONS
+LIST_TYPE_LABELS = {code: label for code, label in LIST_TYPE_OPTIONS}
+LIST_TYPE_KIND_MAP = {
+    IpList.TYPE_ALLOW: "allow",
+    IpList.TYPE_DENY: "deny",
+    IpList.TYPE_LOG: "log",
+    IpList.TYPE_OUTBOUND_DENY: "outbound-deny",
+    IpList.TYPE_ALL_DENY: "all-deny",
+}
+KIND_TO_TYPE = {v: k for k, v in LIST_TYPE_KIND_MAP.items()}
+KIND_TO_TYPE.update({"whitelist": IpList.TYPE_ALLOW, "blacklist": IpList.TYPE_DENY})
+
+
+def _normalize_list_type(value: int) -> int:
+    return value if value in LIST_TYPE_LABELS else IpList.TYPE_ALLOW
+
 
 # ---------------------------------------------------------------------------
 # Helper
@@ -113,7 +129,7 @@ def _search_iplists(db: Session, raw_value: str) -> tuple[str, str, list[dict[st
                 SELECT
                     il.id AS iplist_id,
                     il."flagUserDefined" AS iplist_flag_user_defined,
-                    il."flagBlacklist" AS iplist_flag_blacklist,
+                    il."flagBlacklist" AS iplist_list_type,
                     il."flagInactive" AS iplist_flag_inactive,
                     il.description AS iplist_description,
                     il.comment AS iplist_comment,
@@ -153,7 +169,7 @@ def _search_iplists(db: Session, raw_value: str) -> tuple[str, str, list[dict[st
                 SELECT
                     il.id AS iplist_id,
                     il."flagUserDefined" AS iplist_flag_user_defined,
-                    il."flagBlacklist" AS iplist_flag_blacklist,
+                    il."flagBlacklist" AS iplist_list_type,
                     il."flagInactive" AS iplist_flag_inactive,
                     il.description AS iplist_description,
                     il.comment AS iplist_comment,
@@ -224,17 +240,25 @@ def save_configuration(
 
 @router.get("/exports", response_class=HTMLResponse)
 def page_exports(request: Request):
+    export_types = [
+        {
+            "code": code,
+            "label": label,
+            "kind": LIST_TYPE_KIND_MAP[code],
+        }
+        for code, label in LIST_TYPE_OPTIONS
+    ]
     return templates.TemplateResponse(
         request,
         "exports.html",
-        {},
+        {"export_types": export_types},
     )
 
 
 @router.get("/export/combined/{kind}/{fmt}", response_class=PlainTextResponse)
 def export_combined(kind: str, fmt: str, download: int = 0):
-    if kind not in {"whitelist", "blacklist"}:
-        raise HTTPException(status_code=400, detail="kind must be whitelist or blacklist")
+    if kind not in KIND_TO_TYPE:
+        raise HTTPException(status_code=400, detail="unsupported kind")
     if fmt not in {"rsc", "plain"}:
         raise HTTPException(status_code=400, detail="fmt must be rsc or plain")
 
@@ -299,6 +323,9 @@ def page_iplists(request: Request, db: Session = Depends(get_db)):
         {
             "iplists": iplists,
             "last_jobs": last_jobs,
+            "list_type_options": LIST_TYPE_OPTIONS,
+            "list_type_labels": LIST_TYPE_LABELS,
+            "list_type_kind_map": LIST_TYPE_KIND_MAP,
             "search_query": search_query,
             "search_kind": search_kind,
             "search_error": search_error,
@@ -312,7 +339,7 @@ def page_iplists(request: Request, db: Session = Depends(get_db)):
 def create_iplist(
     url: str = Form(""),
     flagUserDefined: int = Form(0),
-    flagBlacklist: int = Form(0),
+    listType: int = Form(IpList.TYPE_ALLOW),
     description: str = Form(""),
     comment: str = Form(""),
     fetchFrequencyHours: int = Form(0),
@@ -326,7 +353,7 @@ def create_iplist(
     row = IpList(
         url=normalized_url,
         flagUserDefined=flagUserDefined,
-        flagBlacklist=flagBlacklist,
+        flagBlacklist=_normalize_list_type(listType),
         description=description or None,
         comment=comment or None,
         fetchFrequencyHours=0 if flagUserDefined == 1 else fetchFrequencyHours,
@@ -350,7 +377,7 @@ def save_iplist(
     iplist_id: int,
     url: str = Form(""),
     flagUserDefined: int = Form(0),
-    flagBlacklist: int = Form(0),
+    listType: int = Form(IpList.TYPE_ALLOW),
     description: str = Form(""),
     comment: str = Form(""),
     fetchFrequencyHours: int = Form(0),
@@ -366,7 +393,7 @@ def save_iplist(
         raise HTTPException(status_code=400, detail="URL is required for downloaded lists")
     row.url = normalized_url
     row.flagUserDefined = flagUserDefined
-    row.flagBlacklist = flagBlacklist
+    row.flagBlacklist = _normalize_list_type(listType)
     row.description = description or None
     row.comment = comment or None
     row.fetchFrequencyHours = 0 if flagUserDefined == 1 else fetchFrequencyHours
@@ -390,7 +417,7 @@ def delete_iplist(iplist_id: int, db: Session = Depends(get_db)):
 def quick_edit_search_entry(
     iplist_id: int,
     address_id: int,
-    flag_blacklist: int = Form(0),
+    list_type: int = Form(IpList.TYPE_ALLOW),
     iplist_flag_inactive: int = Form(0),
     address_flag_inactive: int = Form(0),
     redirect_to: str = Form("/iplists"),
@@ -408,7 +435,7 @@ def quick_edit_search_entry(
     if not address:
         raise HTTPException(status_code=404, detail="IP address entry not found")
 
-    iplist.flagBlacklist = flag_blacklist
+    iplist.flagBlacklist = _normalize_list_type(list_type)
     iplist.flagInactive = iplist_flag_inactive
     address.flagInactive = address_flag_inactive
     db.commit()

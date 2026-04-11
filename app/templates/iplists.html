@@ -68,7 +68,7 @@
               <div class="small text-muted">{{ row.iplist_description or 'No description' }}</div>
             </td>
             <td>{% if row.iplist_flag_user_defined == 1 %}User Defined{% else %}Downloaded{% endif %}</td>
-            <td>{% if row.iplist_flag_blacklist == 1 %}Deny{% else %}Allow{% endif %}</td>
+            <td>{{ list_type_labels.get(row.iplist_list_type, 'Allow') }}</td>
             <td>
               {% if row.match_type == 'exact' %}
               <span class="badge bg-success">Exact</span>
@@ -90,7 +90,7 @@
                       data-iplist-id="{{ row.iplist_id }}"
                       data-address-id="{{ row.address_id }}"
                       data-matched-address="{{ row.matched_address }}"
-                      data-flag-blacklist="{{ row.iplist_flag_blacklist }}"
+                      data-list-type="{{ row.iplist_list_type }}"
                       data-iplist-flag-inactive="{{ row.iplist_flag_inactive }}"
                       data-address-flag-inactive="{{ row.address_flag_inactive }}"
                       data-iplist-description="{{ row.iplist_description or '' }}"
@@ -143,9 +143,10 @@
             <div class="card-body py-2">
               <div class="mb-2">
                 <label class="form-label form-label-sm mb-1">Type</label>
-                <select name="flag_blacklist" class="form-select form-select-sm" id="sqe-flag-blacklist">
-                  <option value="0">✅ Allow / Whitelist</option>
-                  <option value="1">🚫 Deny / Blacklist</option>
+                <select name="list_type" class="form-select form-select-sm" id="sqe-list-type">
+                  {% for code, label in list_type_options %}
+                  <option value="{{ code }}">{{ label }}</option>
+                  {% endfor %}
                 </select>
               </div>
               <div class="form-check">
@@ -197,9 +198,10 @@
              style="min-width:220px">
     </td>
     <td>
-      <select name="flagBlacklist" class="form-select form-select-sm" style="min-width:120px">
-        <option value="0" {% if row.flagBlacklist == 0 %}selected{% endif %}>✅ Allow</option>
-        <option value="1" {% if row.flagBlacklist == 1 %}selected{% endif %}>🚫 Deny</option>
+      <select name="listType" class="form-select form-select-sm" style="min-width:150px">
+        {% for code, label in list_type_options %}
+        <option value="{{ code }}" {% if row.flagBlacklist == code %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
       </select>
     </td>
     <td><input name="description" class="form-control form-control-sm" value="{{ row.description or '' }}" style="min-width:180px"></td>
@@ -325,9 +327,10 @@
         </div>
         <div class="col-md-4">
           <label class="form-label">Type</label>
-          <select name="flagBlacklist" class="form-select">
-            <option value="0">✅ Allow / Whitelist</option>
-            <option value="1">🚫 Deny / Blacklist</option>
+          <select name="listType" class="form-select">
+            {% for code, label in list_type_options %}
+            <option value="{{ code }}" {% if code == 0 %}selected{% endif %}>{{ label }}</option>
+            {% endfor %}
           </select>
         </div>
         <div class="col-md-4">
@@ -419,7 +422,7 @@ function openSearchQuickEdit(btn) {
   document.getElementById('sqe-header').textContent =
     'List #' + d.iplistId + (d.iplistDescription ? ' — ' + d.iplistDescription : '');
   document.getElementById('sqe-address').textContent = d.matchedAddress;
-  document.getElementById('sqe-flag-blacklist').value = d.flagBlacklist;
+  document.getElementById('sqe-list-type').value = d.listType;
   document.getElementById('sqe-list-inactive').checked = d.iplistFlagInactive === '1';
   document.getElementById('sqe-address-inactive').checked = d.addressFlagInactive === '1';
   const search = window.location.search;
