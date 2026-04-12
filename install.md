@@ -79,6 +79,8 @@ LOG_LEVEL=INFO
 
 > **Security note:** `.env` is listed in `.gitignore` and will never be committed to git. Do not share it.
 
+> **Upgrade note:** Keep your local settings in `.env`, not in tracked repository files. That allows future `git pull` upgrades to succeed without overwriting your machine-specific configuration.
+
 ### Step 3 — Start the services
 
 ```bash
