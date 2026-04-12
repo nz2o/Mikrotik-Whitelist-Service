@@ -102,7 +102,7 @@
         <tr>
           <th>Apply ID</th><th>Firewall ID</th><th>Status</th>
           <th>Started</th><th>Completed</th>
-          <th>WL Count</th><th>BL Count</th><th>Error</th>
+          <th>WL Count</th><th>BL Count</th><th>Ranges</th><th>Covered IPs</th><th>Error</th>
         </tr>
       </thead>
       <tbody>
@@ -121,6 +121,8 @@
         <td class="small">{{ a.completedAt.strftime('%Y-%m-%d %H:%M:%S') if a.completedAt else '—' }}</td>
         <td>{{ a.whitelistCount if a.whitelistCount is not none else '—' }}</td>
         <td>{{ a.blacklistCount if a.blacklistCount is not none else '—' }}</td>
+        <td>{{ a.totalRangeCount if a.totalRangeCount is not none else '—' }}</td>
+        <td>{{ '{:,}'.format(a.totalIpCount) if a.totalIpCount is not none else '—' }}</td>
         <td class="small text-danger">
           {% if a.errorMessage %}
           <span title="{{ a.errorMessage }}">{{ a.errorMessage[:80] }}{% if a.errorMessage|length > 80 %}…{% endif %}</span>
@@ -128,7 +130,7 @@
         </td>
       </tr>
       {% else %}
-      <tr><td colspan="8" class="text-center text-muted py-2">No apply history yet.</td></tr>
+      <tr><td colspan="10" class="text-center text-muted py-2">No apply history yet.</td></tr>
       {% endfor %}
       </tbody>
     </table>

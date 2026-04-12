@@ -76,33 +76,41 @@ def _consolidate(cidrs: list[str]) -> list[str]:
 
 
 def _collapse_entries(entries: list[tuple[str, int]]) -> list[tuple[str, int]]:
-    """Collapse combined entries to minimal set of non-overlapping CIDRs.
-    
-    Since every push replaces the entire list, TTL semantics don't need to be 
-    preserved across different sources. Just deduplicate and supernet-collapse all CIDRs.
-    Returns all collapsed networks with a default TTL of 0 (immaterial since replaced on next push).
+    """Collapse entries to minimal CIDRs while keeping effective TTL values.
+
+    TTL comes from list settings; if missing/invalid, default to DEFAULT_TTL_DAYS.
     """
     if not entries:
         return []
-    
-    # Extract unique CIDRs and parse as networks
-    unique_cidrs = set()
-    for cidr, _ttl in entries:
+
+    # Deduplicate exact networks and keep the longest effective TTL for each.
+    by_network: dict[str, int] = {}
+    for cidr, ttl in entries:
         try:
             net = ipaddress.IPv4Network(cidr, strict=False)
-            unique_cidrs.add(str(net))
+            key = str(net)
+            by_network[key] = max(by_network.get(key, 0), _normalize_ttl(ttl))
         except ValueError:
             log.warning("Skipping invalid CIDR during collapse", extra={"cidr": cidr})
-    
-    if not unique_cidrs:
+
+    if not by_network:
         return []
-    
+
     # Collapse all at once (highly optimized C code)
-    networks = [ipaddress.IPv4Network(cidr, strict=False) for cidr in unique_cidrs]
+    networks = [ipaddress.IPv4Network(cidr, strict=False) for cidr in by_network]
     collapsed = list(ipaddress.collapse_addresses(networks))
-    
-    # Return with default TTL (irrelevant since entire list is replaced each push)
-    return [(str(net), 0) for net in collapsed]
+
+    # For each collapsed network, keep max TTL among member networks.
+    collapsed_ttl: dict[str, int] = {}
+    for original_cidr, ttl in by_network.items():
+        original_net = ipaddress.IPv4Network(original_cidr, strict=False)
+        for collapsed_net in collapsed:
+            if original_net.subnet_of(collapsed_net):
+                key = str(collapsed_net)
+                collapsed_ttl[key] = max(collapsed_ttl.get(key, 0), ttl)
+                break
+
+    return [(cidr, ttl) for cidr, ttl in collapsed_ttl.items()]
 
 
 def _update_apply_status(firewall_id: int, **updates) -> None:
@@ -252,9 +260,10 @@ def _make_rsc_chunks(list_name: str, entries: list[tuple[str, int]]) -> list[str
             # Atomic removal of old list before inserting new entries
             lines.append(f'/ip firewall address-list remove [find list="{list_name}"]')
         for cidr, ttl in batch:
+            effective_ttl = _normalize_ttl(ttl)
             lines.append(
                 f'/ip firewall address-list add list="{list_name}" '
-                f'address={cidr} timeout={ttl}d'
+                f'address={cidr} timeout={effective_ttl}d'
             )
         chunks.append("\n".join(lines) + "\n")
     # Edge case: if entries is empty, still remove old list
@@ -474,6 +483,8 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
             "finishedAt": None,
             "whitelistCount": 0,
             "blacklistCount": 0,
+            "totalRangeCount": 0,
+            "totalIpCount": 0,
             "processedLists": 0,
             "totalLists": 0,
             "processedBuckets": 0,
@@ -517,6 +528,8 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
             blacklistHash=None,
             whitelistCount=0,
             blacklistCount=0,
+            totalRangeCount=0,
+            totalIpCount=0,
         )
         db.add(record)
         db.commit()
@@ -588,6 +601,12 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
             if code != IpList.TYPE_ALLOW:
                 other_entries.extend(datasets.get(code, []))
 
+        total_range_count = sum(len(bucket_entries) for bucket_entries in datasets.values())
+        total_ip_count = 0
+        for bucket_entries in datasets.values():
+            for cidr, _ttl in bucket_entries:
+                total_ip_count += ipaddress.IPv4Network(cidr, strict=False).num_addresses
+
         wl_hash = _sha256_of(allow_entries)  # includes cidr+ttl in hash
         bl_hash = _sha256_of(other_entries)
 
@@ -614,6 +633,8 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
                     finishedAt=datetime.now(timezone.utc).isoformat(),
                     whitelistCount=len(allow_entries),
                     blacklistCount=len(other_entries),
+                    totalRangeCount=total_range_count,
+                    totalIpCount=total_ip_count,
                     lastError="address lists unchanged",
                 )
                 return
@@ -625,6 +646,8 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
             blacklistHash=bl_hash,
             whitelistCount=len(allow_entries),
             blacklistCount=len(other_entries),
+            totalRangeCount=total_range_count,
+            totalIpCount=total_ip_count,
         )
 
         all_chunks: list[str] = []
@@ -639,6 +662,8 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
             sourceIp=source_ip,
             whitelistCount=len(allow_entries),
             blacklistCount=len(other_entries),
+            totalRangeCount=total_range_count,
+            totalIpCount=total_ip_count,
             pushChunksDone=0,
             pushChunksTotal=len(all_chunks),
             lastError=None,
@@ -689,6 +714,8 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
                 finishedAt=datetime.now(timezone.utc).isoformat(),
                 whitelistCount=len(allow_entries),
                 blacklistCount=len(other_entries),
+                totalRangeCount=total_range_count,
+                totalIpCount=total_ip_count,
                 lastError=None,
             )
             log.info(
@@ -697,6 +724,8 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
                     "firewallsId": firewall_id,
                     "whitelistCount": len(allow_entries),
                     "blacklistCount": len(other_entries),
+                    "totalRangeCount": total_range_count,
+                    "totalIpCount": total_ip_count,
                 },
             )
         else:
@@ -714,6 +743,8 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
                 finishedAt=datetime.now(timezone.utc).isoformat(),
                 whitelistCount=len(allow_entries),
                 blacklistCount=len(other_entries),
+                totalRangeCount=total_range_count,
+                totalIpCount=total_ip_count,
                 lastError=last_err,
             )
             log.error(

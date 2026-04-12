@@ -289,6 +289,8 @@ class ApplyHistory(_StandardMixin, Base):
     blacklistHash = Column(Text, nullable=True)
     whitelistCount = Column(Integer, nullable=True)
     blacklistCount = Column(Integer, nullable=True)
+    totalRangeCount = Column(Integer, nullable=True)
+    totalIpCount = Column(BigInteger, nullable=True)
     errorMessage = Column(Text, nullable=True)
 
     firewall = relationship("Firewall", back_populates="applyHistory")
