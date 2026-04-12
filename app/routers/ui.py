@@ -1,6 +1,9 @@
 """UI router — serves all HTML pages."""
 
 import ipaddress
+import re
+import socket
+from urllib.parse import urlencode
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
@@ -39,6 +42,9 @@ LIST_TYPE_KIND_MAP = {
 }
 KIND_TO_TYPE = {v: k for k, v in LIST_TYPE_KIND_MAP.items()}
 KIND_TO_TYPE.update({"whitelist": IpList.TYPE_ALLOW, "blacklist": IpList.TYPE_DENY})
+_DOMAIN_RE = re.compile(
+    r"^(?=.{1,253}$)([A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?)(\.[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?)+$"
+)
 
 
 def _normalize_list_type(value: int) -> int:
@@ -89,6 +95,90 @@ def _parse_bulk_ipv4_lines(raw_text: str) -> tuple[list[str], int]:
         except ValueError:
             invalid_count += 1
     return parsed, invalid_count
+
+
+def _normalize_domain_name(value: str) -> str:
+    candidate = (value or "").strip().split("#", 1)[0].split(";", 1)[0].strip().lower().rstrip(".")
+    if not candidate or not _DOMAIN_RE.match(candidate):
+        raise ValueError("Enter a valid exact domain name")
+    return candidate
+
+
+def _parse_bulk_domain_lines(raw_text: str) -> tuple[list[str], int]:
+    parsed: list[str] = []
+    invalid_count = 0
+    for line in raw_text.splitlines():
+        candidate = line.strip()
+        if not candidate or candidate.startswith("#") or candidate.startswith(";"):
+            continue
+        try:
+            parsed.append(_normalize_domain_name(candidate))
+        except ValueError:
+            invalid_count += 1
+    return parsed, invalid_count
+
+
+def _resolve_domain_ipv4(domain: str) -> list[str]:
+    results: set[str] = set()
+    try:
+        infos = socket.getaddrinfo(domain, None, family=socket.AF_INET, type=socket.SOCK_STREAM)
+        for info in infos:
+            results.add(str(ipaddress.IPv4Address(info[4][0])))
+    except Exception:
+        return []
+    return sorted(results)
+
+
+def _manual_domain_redirect(domain_list_id: int, **params: object) -> RedirectResponse:
+    query = urlencode({k: v for k, v in params.items() if v is not None})
+    target = f"/domainlists/{domain_list_id}/domains"
+    if query:
+        target = f"{target}?{query}"
+    return RedirectResponse(target, status_code=303)
+
+
+def _get_manual_domain_list_or_404(db: Session, domain_list_id: int) -> DomainList:
+    row = db.query(DomainList).filter(DomainList.id == domain_list_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Domain list not found")
+    if row.flagUserDefined != 1:
+        raise HTTPException(status_code=400, detail="Only user-defined domain lists can be edited manually")
+    return row
+
+
+def _get_domain_list_or_404(db: Session, domain_list_id: int) -> DomainList:
+    row = db.query(DomainList).filter(DomainList.id == domain_list_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Domain list not found")
+    return row
+
+
+def _build_manual_domain_entries(rows: list[Domain]) -> list[dict[str, object]]:
+    grouped: dict[str, dict[str, object]] = {}
+    for row in rows:
+        entry = grouped.get(row.domainName)
+        if entry is None:
+            entry = {
+                "id": row.id,
+                "domainName": row.domainName,
+                "ipAddresses": [],
+                "flagInactive": row.flagInactive,
+                "createDate": row.createDate,
+                "updateDate": row.updateDate,
+            }
+            grouped[row.domainName] = entry
+        entry["ipAddresses"].append(row.ipAddress)
+        entry["flagInactive"] = max(int(entry["flagInactive"]), row.flagInactive)
+        if row.createDate < entry["createDate"]:
+            entry["createDate"] = row.createDate
+        if row.updateDate > entry["updateDate"]:
+            entry["updateDate"] = row.updateDate
+
+    entries = list(grouped.values())
+    for entry in entries:
+        entry["ipAddresses"] = sorted(set(entry["ipAddresses"]))
+    entries.sort(key=lambda item: str(item["domainName"]))
+    return entries
 
 
 def _get_manual_list_or_404(db: Session, iplist_id: int) -> IpList:
@@ -444,6 +534,234 @@ def delete_domain_list(domain_list_id: int, db: Session = Depends(get_db)):
     db.delete(row)
     db.commit()
     return RedirectResponse("/domainlists", status_code=303)
+
+
+@router.get("/domainlists/{domain_list_id}/domains", response_class=HTMLResponse)
+def page_domains(domain_list_id: int, request: Request, db: Session = Depends(get_db)):
+    domain_list = _get_domain_list_or_404(db, domain_list_id)
+    domain_rows = (
+        db.query(Domain)
+        .filter(Domain.domainListsId == domain_list_id)
+        .order_by(Domain.domainName, Domain.ipAddress, Domain.id)
+        .all()
+    )
+
+    return templates.TemplateResponse(
+        request,
+        "domains.html",
+        {
+            "domain_list": domain_list,
+            "domain_rows": domain_rows,
+            "manual_entries": _build_manual_domain_entries(domain_rows)
+            if domain_list.flagUserDefined == 1
+            else [],
+            "manual_mode": domain_list.flagUserDefined == 1,
+        },
+    )
+
+
+@router.post("/domainlists/{domain_list_id}/domains/new")
+def create_manual_domain(
+    domain_list_id: int,
+    domainName: str = Form(...),
+    flagInactive: int = Form(0),
+    db: Session = Depends(get_db),
+):
+    _get_manual_domain_list_or_404(db, domain_list_id)
+    try:
+        normalized = _normalize_domain_name(domainName)
+    except ValueError as exc:
+        return _manual_domain_redirect(domain_list_id, error=str(exc))
+
+    existing = (
+        db.query(Domain.id)
+        .filter(Domain.domainListsId == domain_list_id, Domain.domainName == normalized)
+        .first()
+    )
+    if existing:
+        return _manual_domain_redirect(domain_list_id, error="Domain already exists in this list")
+
+    resolved_ips = _resolve_domain_ipv4(normalized)
+    if not resolved_ips:
+        return _manual_domain_redirect(
+            domain_list_id,
+            error="Domain did not resolve to any IPv4 A records",
+        )
+
+    db.bulk_insert_mappings(
+        Domain,
+        [
+            {
+                "domainName": normalized,
+                "ipAddress": ip_address,
+                "domainListsId": domain_list_id,
+                "flagInactive": flagInactive,
+            }
+            for ip_address in resolved_ips
+        ],
+    )
+    db.commit()
+    return _manual_domain_redirect(domain_list_id, added=1)
+
+
+@router.post("/domainlists/{domain_list_id}/domains/bulk")
+async def bulk_import_manual_domains(
+    domain_list_id: int,
+    bulkText: str = Form(""),
+    uploadFile: UploadFile | None = File(default=None),
+    db: Session = Depends(get_db),
+):
+    _get_manual_domain_list_or_404(db, domain_list_id)
+
+    chunks: list[str] = []
+    if bulkText.strip():
+        chunks.append(bulkText)
+
+    if uploadFile and uploadFile.filename:
+        uploaded = await uploadFile.read()
+        decoded = uploaded.decode("utf-8", errors="replace")
+        if decoded.strip():
+            chunks.append(decoded)
+
+    if not chunks:
+        return _manual_domain_redirect(domain_list_id, bulk_error=1)
+
+    normalized_entries: list[str] = []
+    invalid_count = 0
+    for chunk in chunks:
+        parsed, invalid = _parse_bulk_domain_lines(chunk)
+        normalized_entries.extend(parsed)
+        invalid_count += invalid
+
+    unique_entries: list[str] = []
+    seen: set[str] = set()
+    for entry in normalized_entries:
+        if entry not in seen:
+            seen.add(entry)
+            unique_entries.append(entry)
+
+    existing_domains = {
+        row[0]
+        for row in db.query(Domain.domainName)
+        .filter(Domain.domainListsId == domain_list_id)
+        .distinct()
+        .all()
+    }
+
+    to_insert: list[dict[str, object]] = []
+    added_count = 0
+    unresolved_count = 0
+    duplicate_count = 0
+    for domain_name in unique_entries:
+        if domain_name in existing_domains:
+            duplicate_count += 1
+            continue
+        resolved_ips = _resolve_domain_ipv4(domain_name)
+        if not resolved_ips:
+            unresolved_count += 1
+            continue
+        to_insert.extend(
+            {
+                "domainName": domain_name,
+                "ipAddress": ip_address,
+                "domainListsId": domain_list_id,
+            }
+            for ip_address in resolved_ips
+        )
+        added_count += 1
+        existing_domains.add(domain_name)
+
+    if to_insert:
+        db.bulk_insert_mappings(Domain, to_insert)
+        db.commit()
+
+    return _manual_domain_redirect(
+        domain_list_id,
+        bulk_added=added_count,
+        bulk_invalid=invalid_count,
+        bulk_duplicate=duplicate_count,
+        bulk_unresolved=unresolved_count,
+    )
+
+
+@router.post("/domainlists/{domain_list_id}/domains/{entry_id}/save")
+def save_manual_domain(
+    domain_list_id: int,
+    entry_id: int,
+    currentDomainName: str = Form(...),
+    domainName: str = Form(...),
+    flagInactive: int = Form(0),
+    db: Session = Depends(get_db),
+):
+    _get_manual_domain_list_or_404(db, domain_list_id)
+    existing_rows = (
+        db.query(Domain)
+        .filter(Domain.domainListsId == domain_list_id, Domain.domainName == currentDomainName)
+        .all()
+    )
+    if not existing_rows or not any(row.id == entry_id for row in existing_rows):
+        raise HTTPException(status_code=404, detail="Manual domain entry not found")
+
+    try:
+        normalized = _normalize_domain_name(domainName)
+    except ValueError as exc:
+        return _manual_domain_redirect(domain_list_id, error=str(exc))
+
+    if normalized != currentDomainName:
+        collision = (
+            db.query(Domain.id)
+            .filter(Domain.domainListsId == domain_list_id, Domain.domainName == normalized)
+            .first()
+        )
+        if collision:
+            return _manual_domain_redirect(domain_list_id, error="Domain already exists in this list")
+
+    resolved_ips = _resolve_domain_ipv4(normalized)
+    if not resolved_ips:
+        return _manual_domain_redirect(
+            domain_list_id,
+            error="Domain did not resolve to any IPv4 A records",
+        )
+
+    db.query(Domain).filter(
+        Domain.domainListsId == domain_list_id,
+        Domain.domainName == currentDomainName,
+    ).delete()
+    db.bulk_insert_mappings(
+        Domain,
+        [
+            {
+                "domainName": normalized,
+                "ipAddress": ip_address,
+                "domainListsId": domain_list_id,
+                "flagInactive": flagInactive,
+            }
+            for ip_address in resolved_ips
+        ],
+    )
+    db.commit()
+    return _manual_domain_redirect(domain_list_id, saved=1)
+
+
+@router.post("/domainlists/{domain_list_id}/domains/{entry_id}/delete")
+def delete_manual_domain(
+    domain_list_id: int,
+    entry_id: int,
+    currentDomainName: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    _get_manual_domain_list_or_404(db, domain_list_id)
+    rows = (
+        db.query(Domain)
+        .filter(Domain.domainListsId == domain_list_id, Domain.domainName == currentDomainName)
+        .all()
+    )
+    if not rows or not any(row.id == entry_id for row in rows):
+        raise HTTPException(status_code=404, detail="Manual domain entry not found")
+    for row in rows:
+        db.delete(row)
+    db.commit()
+    return _manual_domain_redirect(domain_list_id, deleted=1)
 
 
 @router.post("/iplists/new")

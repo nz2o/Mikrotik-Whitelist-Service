@@ -16,6 +16,7 @@
 <div class="alert alert-info py-2">
   <i class="bi bi-info-circle me-2"></i>
   Each fetched domain is resolved to IPv4 A records and those IPs are merged into combined exports/apply by list type.
+  User-defined domain lists are edited from the <strong>Edit Domains</strong> button in the Actions column.
 </div>
 
 <div id="domain-fetch-feedback" class="alert d-none py-2" role="alert"></div>
@@ -78,6 +79,15 @@
           onclick="triggerDomainFetchButton(this)">
           <i class="bi bi-arrow-clockwise"></i>
         </button>
+        <a class="btn btn-sm btn-outline-secondary" title="View Resolved Domains"
+           href="/domainlists/{{ row.id }}/domains">
+          <i class="bi bi-eye me-1"></i>View Domains
+        </a>
+        {% else %}
+        <a class="btn btn-sm btn-outline-secondary" title="Edit Manual Domains"
+           href="/domainlists/{{ row.id }}/domains">
+          <i class="bi bi-pencil-square me-1"></i>Edit Domains
+        </a>
         {% endif %}
         <form method="post" action="/domainlists/{{ row.id }}/delete"
               onsubmit="return confirm('Delete domain list {{ row.id }} and all resolved rows?')">
