@@ -93,6 +93,11 @@
             {{ ap.status }}
           </span>
           <span class="text-muted">{{ ap.startedAt.strftime('%Y-%m-%d %H:%M:%S') if ap.startedAt else '' }}</span>
+          {% if ap.status == 'failed' and ap.errorMessage %}
+          <span class="text-danger small" title="{{ ap.errorMessage }}">
+            <i class="bi bi-exclamation-circle-fill me-1"></i>{{ ap.errorMessage[:100] }}{% if ap.errorMessage | length > 100 %}…{% endif %}
+          </span>
+          {% endif %}
         {% else %}
           <span class="text-muted">—</span>
         {% endif %}

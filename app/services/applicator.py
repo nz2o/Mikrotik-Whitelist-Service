@@ -27,6 +27,11 @@ from app.models import ApplyHistory, Configuration, Domain, DomainList, Firewall
 
 log = logging.getLogger(__name__)
 
+
+class _SshAuthError(Exception):
+    """SSH authentication failure — retrying will not help."""
+
+
 CHUNK_SIZE = 500  # max CIDRs per RouterOS script chunk
 _APPLY_STATUS_LOCK = threading.Lock()
 _APPLY_STATUS: dict[int, dict[str, object]] = {}
@@ -329,17 +334,23 @@ def _push_chunks(fw: Firewall, chunks: list[str]) -> None:
     try:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(
-            hostname=fw.firewallAddress,
-            port=fw.firewallPort,
-            username=fw.firewallUser,
-            password=plaintext_secret,
-            timeout=APPLY_TIMEOUT_SECONDS,
-            auth_timeout=APPLY_TIMEOUT_SECONDS,
-            banner_timeout=APPLY_TIMEOUT_SECONDS,
-            look_for_keys=False,
-            allow_agent=False,
-        )
+        try:
+            client.connect(
+                hostname=fw.firewallAddress,
+                port=fw.firewallPort,
+                username=fw.firewallUser,
+                password=plaintext_secret,
+                timeout=APPLY_TIMEOUT_SECONDS,
+                auth_timeout=APPLY_TIMEOUT_SECONDS,
+                banner_timeout=APPLY_TIMEOUT_SECONDS,
+                look_for_keys=False,
+                allow_agent=False,
+            )
+        except paramiko.AuthenticationException:
+            raise _SshAuthError(
+                f"SSH authentication failed for {fw.firewallUser}@"
+                f"{fw.firewallAddress}:{fw.firewallPort} — check username/password"
+            )
         for chunk in chunks:
             stdin, stdout, stderr = client.exec_command(chunk, timeout=APPLY_TIMEOUT_SECONDS)
             exit_code = stdout.channel.recv_exit_status()
@@ -489,6 +500,13 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
                 _push_chunks(fw, all_chunks)
                 pushed = True
                 break
+            except _SshAuthError as exc:
+                last_err = str(exc)
+                log.error(
+                    "SSH authentication failed; aborting retries",
+                    extra={"firewallsId": firewall_id, "error": last_err},
+                )
+                break  # credentials won't change; no point retrying
             except Exception as exc:
                 last_err = str(exc)
                 log.warning(
