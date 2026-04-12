@@ -12,6 +12,7 @@ Responsibilities:
 import hashlib
 import ipaddress
 import logging
+import socket
 import threading
 import time
 from datetime import datetime, timezone
@@ -344,7 +345,24 @@ def build_iplist_plain(iplist_id: int) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _push_chunks(fw: Firewall, chunks: list[str]) -> None:
+def _probe_ssh_port(fw: "Firewall", timeout: float) -> tuple[str | None, str | None]:
+    """TCP-connect to the firewall's SSH port.
+
+    Returns (source_ip, error_message).  source_ip is the local address the
+    OS chose for the connection (i.e. what the router sees as the origin).
+    error_message is None on success.
+    """
+    try:
+        with socket.create_connection(
+            (fw.firewallAddress, fw.firewallPort), timeout=timeout
+        ) as sock:
+            source_ip = sock.getsockname()[0]
+        return source_ip, None
+    except OSError as exc:
+        return None, str(exc)
+
+
+def _push_chunks(fw: "Firewall", chunks: list[str]) -> None:
     """Connect to firewall via SSH and execute all script chunks."""
     plaintext_secret = decrypt_secret(fw.firewallSecret)
     try:
@@ -408,6 +426,7 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
             "blacklistCount": 0,
             "processedLists": 0,
             "totalLists": 0,
+            "sourceIp": None,
             "lastError": None,
         }
 
@@ -438,7 +457,7 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
 
         record = ApplyHistory(
             firewallsId=firewall_id,
-            status="generating",
+            status="connecting",
             startedAt=datetime.now(timezone.utc),
             whitelistHash=None,
             blacklistHash=None,
@@ -450,7 +469,46 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
         db.refresh(record)
         record_id = record.id
 
-        _update_apply_status(firewall_id, status="generating", processedLists=0, totalLists=0)
+        _update_apply_status(firewall_id, status="connecting", processedLists=0, totalLists=0)
+        source_ip, probe_err = _probe_ssh_port(fw, timeout=min(APPLY_TIMEOUT_SECONDS, 10))
+        if probe_err is not None:
+            _update_history(
+                db,
+                record_id,
+                status="failed",
+                completedAt=datetime.now(timezone.utc),
+                errorMessage=f"Unreachable: {probe_err}",
+            )
+            _update_apply_status(
+                firewall_id,
+                active=False,
+                status="failed",
+                finishedAt=datetime.now(timezone.utc).isoformat(),
+                lastError=f"Unreachable: {probe_err}",
+            )
+            log.error(
+                "Firewall unreachable",
+                extra={"firewallsId": firewall_id, "error": probe_err},
+            )
+            return
+
+        log.info(
+            "Firewall reachable",
+            extra={
+                "firewallsId": firewall_id,
+                "sourceIp": source_ip,
+                "target": f"{fw.firewallAddress}:{fw.firewallPort}",
+            },
+        )
+
+        _update_history(db, record_id, status="generating")
+        _update_apply_status(
+            firewall_id,
+            status="generating",
+            sourceIp=source_ip,
+            processedLists=0,
+            totalLists=0,
+        )
         datasets = get_combined_entries(
             on_list_done=lambda done, total: _update_apply_status(
                 firewall_id, processedLists=done, totalLists=total
@@ -510,6 +568,7 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
         _update_apply_status(
             firewall_id,
             status="pushing",
+            sourceIp=source_ip,
             whitelistCount=len(allow_entries),
             blacklistCount=len(other_entries),
             lastError=None,

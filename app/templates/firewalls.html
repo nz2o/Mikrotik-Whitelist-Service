@@ -88,11 +88,11 @@
           <span class="badge status-badge
             {% if ap.status == 'complete' %}bg-success
             {% elif ap.status == 'failed' %}bg-danger
-            {% elif ap.status in ['generating','pushing'] %}bg-warning text-dark
+            {% elif ap.status in ['generating','connecting','pushing'] %}bg-warning text-dark
             {% else %}bg-secondary{% endif %}">
             {{ ap.status }}
           </span>
-          {% if ap.status in ['generating', 'pushing'] %}
+          {% if ap.status in ['generating', 'connecting', 'pushing'] %}
           <span class="spinner-border spinner-border-sm text-warning align-middle" role="status" aria-hidden="true"></span>
           {% endif %}
           <span class="text-muted">{{ ap.startedAt.strftime('%Y-%m-%d %H:%M:%S') if ap.startedAt else '' }}</span>
@@ -210,9 +210,13 @@ function pollApplyStatus(id) {
     .then((data) => {
       if (data.active) {
         let message;
-        if (data.status === 'pushing') {
-          message = `Pushing ${data.whitelistCount || 0} allow and ${data.blacklistCount || 0} deny entries`;
-        } else {
+          if (data.status === 'connecting') {
+            const src = data.sourceIp ? ` (from ${data.sourceIp})` : '';
+            message = `Connecting to router${src}...`;
+          } else if (data.status === 'pushing') {
+            const src = data.sourceIp ? ` from ${data.sourceIp}` : '';
+            message = `Pushing${src}: ${data.whitelistCount || 0} allow, ${data.blacklistCount || 0} deny entries`;
+          } else {
           const done = data.processedLists || 0;
           const total = data.totalLists || 0;
           if (total > 0) {
