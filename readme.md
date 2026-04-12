@@ -53,7 +53,7 @@ A typical use case is allowing only traffic from a specific country (e.g. US-onl
                              │
                      ┌───────▼────────┐
                      │   FastAPI UI   │
-                     │  (port 8000)   │
+                     │ (API_PORT env) │
                      └────────────────┘
 ```
 
@@ -92,7 +92,7 @@ cp examples/.env.example .env
 docker compose up -d
 ```
 
-Open [http://localhost:8000](http://localhost:8000) in your browser.
+Open `http://localhost:<API_PORT>` in your browser. With the default configuration, that is [http://localhost:8000](http://localhost:8000).
 
 ---
 
@@ -105,6 +105,7 @@ Open [http://localhost:8000](http://localhost:8000) in your browser.
 | `POSTGRES_HOST` | PostgreSQL host (use `postgres` inside Docker) |
 | `POSTGRES_PORT` | PostgreSQL port (default `5432`) |
 | `POSTGRES_DATABASE` | Database name (default schema is `iplist`) |
+| `API_PORT` | Port exposed for the FastAPI UI (default `8000`) |
 | `ENCRYPTION_KEY` | 64-character hex AES-256 key — generate with `openssl rand -hex 32` |
 | `FETCH_TIMEOUT_SECONDS` | HTTP download timeout per request (default `30`) |
 | `FETCH_RETRIES` | Download retry attempts before failing (default `3`) |

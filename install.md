@@ -67,6 +67,8 @@ POSTGRES_HOST=postgres
 POSTGRES_PORT=5432
 POSTGRES_DATABASE=mikrotik
 
+API_PORT=8000
+
 ENCRYPTION_KEY=paste-your-64-char-hex-key-here
 
 FETCH_TIMEOUT_SECONDS=30
@@ -91,7 +93,7 @@ Docker will:
 
 ### Step 4 — Open the web UI
 
-Navigate to [http://localhost:8000](http://localhost:8000) in your browser.
+Navigate to `http://localhost:<API_PORT>` in your browser. With the default setting above, that is [http://localhost:8000](http://localhost:8000).
 
 The first time you open it you'll see the Configuration page. Leave everything at default (Off) until you've added your IP lists and firewalls.
 
