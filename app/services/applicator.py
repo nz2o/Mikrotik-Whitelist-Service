@@ -47,6 +47,7 @@ class _SshAuthError(Exception):
 CHUNK_SIZE = 50  # balance command throughput with RouterOS execution latency
 MAX_CHUNK_BYTES = 5000  # keep chunks moderate; avoid long-running giant script payloads
 TTL_REFRESH_THRESHOLD_DAYS = 4
+MAX_DELETE_OPS_PER_APPLY = 300
 _APPLY_STATUS_LOCK = threading.Lock()
 _APPLY_STATUS: dict[int, dict[str, object]] = {}
 IN_PROGRESS_APPLY_STATUSES = {
@@ -432,7 +433,7 @@ def _plan_delta_units(
     desired_by_list: dict[str, dict[str, int]],
     generation_tag: str,
     now: datetime,
-) -> tuple[list[list[str]], dict[tuple[str, str], tuple[int, int | None]], set[int]]:
+) -> tuple[list[list[str]], dict[tuple[str, str], tuple[int, int | None]], set[int], int]:
     """Plan incremental RouterOS operations and DB state changes.
 
     Returns:
@@ -447,20 +448,15 @@ def _plan_delta_units(
         for addr in by_addr.keys()
     }
 
-    units: list[list[str]] = []
+    add_or_refresh_units: list[list[str]] = []
+    delete_units: list[list[str]] = []
     upserts: dict[tuple[str, str], tuple[int, int | None]] = {}
-    delete_ids: set[int] = set()
+    delete_candidates: list[tuple[tuple[str, str], int]] = []
 
-    # Remove entries no longer desired.
+    # Identify entries no longer desired; removals are throttled per apply.
     for key, row in existing_by_key.items():
-        list_name, addr = key
         if key not in desired_keys:
-            units.append(
-                [
-                    f':do {{ /ip firewall address-list remove [find where list="{list_name}" and address={addr}] }} on-error={{}}'
-                ]
-            )
-            delete_ids.add(row.id)
+            delete_candidates.append((key, row.id))
 
     # Add or refresh entries that are new/changed/near expiry.
     for list_name, by_addr in desired_by_list.items():
@@ -483,7 +479,7 @@ def _plan_delta_units(
                         needs_refresh = True
 
             if needs_refresh:
-                units.append(
+                add_or_refresh_units.append(
                     [
                         f':do {{ /ip firewall address-list add list="{list_name}" '
                         f'address={addr} timeout={ttl_days}d comment="{generation_tag}" }} '
@@ -495,7 +491,19 @@ def _plan_delta_units(
                 )
                 upserts[key] = (ttl_days, row.id if row else None)
 
-    return units, upserts, delete_ids
+    delete_ids: set[int] = set()
+    for key, row_id in delete_candidates[:MAX_DELETE_OPS_PER_APPLY]:
+        list_name, addr = key
+        delete_units.append(
+            [
+                f':do {{ /ip firewall address-list remove [find where list="{list_name}" and address={addr}] }} on-error={{}}'
+            ]
+        )
+        delete_ids.add(row_id)
+
+    deferred_delete_count = max(0, len(delete_candidates) - len(delete_ids))
+    units = add_or_refresh_units + delete_units
+    return units, upserts, delete_ids, deferred_delete_count
 
 
 def _apply_delta_state(
@@ -964,13 +972,22 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
             )
             .all()
         )
-        delta_units, delta_upserts, delta_delete_ids = _plan_delta_units(
+        delta_units, delta_upserts, delta_delete_ids, deferred_delete_count = _plan_delta_units(
             existing_rows=existing_state_rows,
             desired_by_list=desired_by_list,
             generation_tag=generation_tag,
             now=now_utc,
         )
         all_chunks = _pack_script_units(delta_units)
+        if deferred_delete_count:
+            log.info(
+                "Deferred stale deletions for next apply runs",
+                extra={
+                    "firewallsId": firewall_id,
+                    "deferredDeletes": deferred_delete_count,
+                    "deleteCap": MAX_DELETE_OPS_PER_APPLY,
+                },
+            )
 
         # Idempotency check (skipped when force=True)
         if not force and not all_chunks:
@@ -1030,6 +1047,7 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
             currentChunkLineCount=0,
             currentChunkBytes=0,
             routerFeedback="starting push",
+            deferredDeletes=deferred_delete_count,
             lastError=None,
         )
 
