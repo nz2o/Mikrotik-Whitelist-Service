@@ -92,6 +92,9 @@
             {% else %}bg-secondary{% endif %}">
             {{ ap.status }}
           </span>
+          {% if ap.status in ['generating', 'pushing'] %}
+          <span class="spinner-border spinner-border-sm text-warning align-middle" role="status" aria-hidden="true"></span>
+          {% endif %}
           <span class="text-muted">{{ ap.startedAt.strftime('%Y-%m-%d %H:%M:%S') if ap.startedAt else '' }}</span>
           {% if ap.status == 'failed' and ap.errorMessage %}
           <span class="text-danger small" title="{{ ap.errorMessage }}">
@@ -206,9 +209,19 @@ function pollApplyStatus(id) {
     .then((response) => response.json())
     .then((data) => {
       if (data.active) {
-        const message = data.status === 'pushing'
-          ? `Pushing ${data.whitelistCount || 0} allow and ${data.blacklistCount || 0} deny entries`
-          : 'Generating consolidated lists...';
+        let message;
+        if (data.status === 'pushing') {
+          message = `Pushing ${data.whitelistCount || 0} allow and ${data.blacklistCount || 0} deny entries`;
+        } else {
+          const done = data.processedLists || 0;
+          const total = data.totalLists || 0;
+          if (total > 0) {
+            const pct = Math.round((done / total) * 100);
+            message = `Generating... ${done}/${total} lists (${pct}%)`;
+          } else {
+            message = 'Generating consolidated lists...';
+          }
+        }
         updateApplyStatusLine(id, message);
         showApplyFeedback('info', `Firewall ${id}: ${message}`);
         scheduleApplyPoll(id, 2000);
@@ -274,5 +287,19 @@ function triggerApplyAll(btn) {
     })
     .finally(() => { btn.disabled = false; btn.innerHTML = '<i class="bi bi-send me-1"></i>Apply All'; });
 }
+
+document.addEventListener('DOMContentLoaded', () => {
+  fetch('/internal/apply/active')
+    .then(r => r.json())
+    .then(data => {
+      (data.active || []).forEach(s => {
+        if (s.firewallsId) {
+          updateApplyStatusLine(s.firewallsId, 'Resuming status check...');
+          pollApplyStatus(s.firewallsId);
+        }
+      });
+    })
+    .catch(() => {});
+});
 </script>
 {% endblock %}

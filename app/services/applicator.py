@@ -134,11 +134,13 @@ def trigger_apply_async(firewall_id: int, force: bool = False) -> bool:
     return True
 
 
-def _build_datasets() -> dict[int, list[tuple[str, int]]]:
+def _build_datasets(on_list_done=None) -> dict[int, list[tuple[str, int]]]:
     """Return map of list_type -> [(cidr, ttl_days), ...].
 
     CIDRs are consolidated within each IP list separately so that per-list TTL
     values are preserved. Entries from different lists are NOT merged together.
+
+    on_list_done: optional callable(done: int, total: int) called after each list is processed.
     """
     db = SessionLocal()
     try:
@@ -147,6 +149,13 @@ def _build_datasets() -> dict[int, list[tuple[str, int]]]:
             .filter(IpList.flagInactive == 0)
             .all()
         )
+        active_domain_lists = (
+            db.query(DomainList)
+            .filter(DomainList.flagInactive == 0)
+            .all()
+        )
+        total = len(active_lists) + len(active_domain_lists)
+        done = 0
         datasets: dict[int, list[tuple[str, int]]] = {
             code: [] for code, _label in IpList.TYPE_OPTIONS
         }
@@ -165,12 +174,10 @@ def _build_datasets() -> dict[int, list[tuple[str, int]]]:
             consolidated = _consolidate(raw)
             entries = [(cidr, ttl) for cidr in consolidated]
             datasets[list_type].extend(entries)
+            done += 1
+            if on_list_done:
+                on_list_done(done, total)
 
-        active_domain_lists = (
-            db.query(DomainList)
-            .filter(DomainList.flagInactive == 0)
-            .all()
-        )
         for dl in active_domain_lists:
             ttl = dl.ttlDays if dl.ttlDays is not None else DEFAULT_TTL_DAYS
             list_type = dl.listType if dl.listType in datasets else IpList.TYPE_ALLOW
@@ -186,6 +193,9 @@ def _build_datasets() -> dict[int, list[tuple[str, int]]]:
             consolidated = _consolidate(raw)
             entries = [(cidr, ttl) for cidr in consolidated]
             datasets[list_type].extend(entries)
+            done += 1
+            if on_list_done:
+                on_list_done(done, total)
     finally:
         db.close()
 
@@ -243,10 +253,16 @@ def _normalize_ttl(ttl_days: Optional[int]) -> int:
     return ttl_days
 
 
-def get_combined_entries() -> dict[int, list[tuple[str, int]]]:
+def get_combined_entries(on_list_done=None) -> dict[int, list[tuple[str, int]]]:
     """Public helper for export and apply consumers."""
-    datasets = _build_datasets()
+    datasets = _build_datasets(on_list_done=on_list_done)
     return {list_type: _collapse_entries(entries) for list_type, entries in datasets.items()}
+
+
+def get_all_active_applies() -> list[dict]:
+    """Return status dicts for all currently running applies."""
+    with _APPLY_STATUS_LOCK:
+        return [dict(v) for v in _APPLY_STATUS.values() if v.get("active")]
 
 
 def build_combined_rsc(kind: str) -> str:
@@ -390,6 +406,8 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
             "finishedAt": None,
             "whitelistCount": 0,
             "blacklistCount": 0,
+            "processedLists": 0,
+            "totalLists": 0,
             "lastError": None,
         }
 
@@ -432,8 +450,12 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
         db.refresh(record)
         record_id = record.id
 
-        _update_apply_status(firewall_id, status="generating")
-        datasets = get_combined_entries()
+        _update_apply_status(firewall_id, status="generating", processedLists=0, totalLists=0)
+        datasets = get_combined_entries(
+            on_list_done=lambda done, total: _update_apply_status(
+                firewall_id, processedLists=done, totalLists=total
+            )
+        )
         allow_entries = datasets.get(IpList.TYPE_ALLOW, [])
         other_entries = []
         for code, _label in IpList.TYPE_OPTIONS:

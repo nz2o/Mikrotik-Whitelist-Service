@@ -77,6 +77,12 @@ def trigger_apply_one(firewall_id: int):
     }
 
 
+@router.get("/apply/active")
+def get_active_applies():
+    """Return status dicts for all firewalls currently being applied."""
+    return {"active": applicator_svc.get_all_active_applies()}
+
+
 @router.get("/apply/{firewall_id}/status")
 def get_apply_status(firewall_id: int):
     """Return the in-process status for a manual firewall apply."""
