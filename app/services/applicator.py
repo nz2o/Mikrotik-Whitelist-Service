@@ -80,6 +80,14 @@ TYPE_TO_LIST_NAME = {
     IpList.TYPE_OUTBOUND_DENY: "ip-outbound-deny-dynamic",
     IpList.TYPE_ALL_DENY: "ip-all-deny-dynamic",
 }
+IGNORED_HOST_ADDRESSES = {
+    ipaddress.IPv4Address("0.0.0.0"),
+    ipaddress.IPv4Address("255.255.255.255"),
+}
+
+
+def _should_ignore_network(net: ipaddress.IPv4Network) -> bool:
+    return net.prefixlen == 32 and net.network_address in IGNORED_HOST_ADDRESSES
 
 
 def _consolidate(cidrs: list[str]) -> list[str]:
@@ -87,7 +95,11 @@ def _consolidate(cidrs: list[str]) -> list[str]:
     nets = []
     for c in cidrs:
         try:
-            nets.append(ipaddress.IPv4Network(c, strict=False))
+            net = ipaddress.IPv4Network(c, strict=False)
+            if _should_ignore_network(net):
+                log.info("Ignoring special host address during consolidation", extra={"cidr": c})
+                continue
+            nets.append(net)
         except ValueError:
             log.warning("Skipping invalid CIDR during consolidation", extra={"cidr": c})
     collapsed = list(ipaddress.collapse_addresses(nets))
@@ -111,6 +123,9 @@ def _collapse_entries(entries: list[tuple[str, int]]) -> list[tuple[str, int]]:
     for cidr, ttl in entries:
         try:
             net = ipaddress.IPv4Network(cidr, strict=False)
+            if _should_ignore_network(net):
+                log.info("Ignoring special host address during collapse", extra={"cidr": cidr})
+                continue
             ttl_groups[_normalize_ttl(ttl)].append(net)
         except ValueError:
             log.warning("Skipping invalid CIDR during collapse", extra={"cidr": cidr})
@@ -435,16 +450,6 @@ def _plan_delta_units(
     units: list[list[str]] = []
     upserts: dict[tuple[str, str], tuple[int, int | None]] = {}
     delete_ids: set[int] = set()
-
-    for list_name in desired_by_list.keys():
-        units.append(
-            [
-                f':foreach i in=[/ip firewall address-list find list="{list_name}"] do={{ '
-                f':local c [/ip firewall address-list get $i comment]; '
-                f':if (([:len $c] = 0) or ([:pick $c 0 4] != "mws:")) do={{ /ip firewall address-list remove $i }} '
-                f'}}'
-            ]
-        )
 
     # Remove entries no longer desired.
     for key, row in existing_by_key.items():
