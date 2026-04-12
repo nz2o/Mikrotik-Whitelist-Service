@@ -48,7 +48,7 @@ Copy the output — you'll paste it into `.env` in the next step.
 ### Step 1 — Clone the repository
 
 ```bash
-git clone https://github.com/your-org/Mikrotik-Whitelist-Service.git
+git clone https://github.com/nz2o/Mikrotik-Whitelist-Service.git
 cd Mikrotik-Whitelist-Service
 ```
 
