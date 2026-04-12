@@ -80,6 +80,7 @@ Quick preview:
 ## Quick Start
 
 See [install.md](install.md) for full step-by-step instructions.
+See [upgrade.md](upgrade.md) for upgrade steps on an existing Docker server.
 
 Useful example sources:
 
