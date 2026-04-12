@@ -82,6 +82,7 @@
         <span class="text-muted">Created: {{ fw.createDate.strftime('%Y-%m-%d %H:%M:%S') }}</span>
         <span class="text-muted">Updated: {{ fw.updateDate.strftime('%Y-%m-%d %H:%M:%S') }}</span>
         <span class="text-muted" id="apply-status-{{ fw.id }}"></span>
+        <span class="text-muted d-block w-100" id="apply-status-debug-{{ fw.id }}" style="white-space: pre-wrap; word-break: break-word;"></span>
         {% set ap = last_applies.get(fw.id) %}
         <span class="text-muted">Last Apply:</span>
         {% if ap %}
@@ -190,6 +191,13 @@ function updateApplyStatusLine(id, message) {
   }
 }
 
+function updateApplyDebugLine(id, message) {
+  const el = document.getElementById(`apply-status-debug-${id}`);
+  if (el) {
+    el.textContent = message || '';
+  }
+}
+
 function stopApplyPolling(id) {
   const timer = activeApplyPollers.get(String(id));
   if (timer) {
@@ -217,12 +225,18 @@ function pollApplyStatus(id) {
             const src = data.sourceIp ? ` from ${data.sourceIp}` : '';
             const done = data.pushChunksDone || 0;
             const total = data.pushChunksTotal || 0;
+            const cmd = data.currentChunkText ? `cmd:\n${data.currentChunkText}` : '';
+            const feedback = data.routerFeedback ? `feedback: ${data.routerFeedback}` : '';
+            const metrics = (data.currentChunkLineCount || data.currentChunkBytes)
+              ? `chunkPayload: ${data.currentChunkLineCount || 0} lines, ${data.currentChunkBytes || 0} bytes`
+              : '';
             if (total > 0) {
               const pct = Math.round((done / total) * 100);
               message = `Pushing${src}: chunk ${done}/${total} (${pct}%), ${data.whitelistCount || 0} allow, ${data.blacklistCount || 0} deny`;
             } else {
               message = `Pushing${src}: ${data.whitelistCount || 0} allow, ${data.blacklistCount || 0} deny entries`;
             }
+            updateApplyDebugLine(id, [metrics, cmd, feedback].filter(Boolean).join(' | '));
           } else if (data.status === 'collapsing') {
             const done = data.processedBuckets || 0;
             const total = data.totalBuckets || 0;
@@ -232,6 +246,7 @@ function pollApplyStatus(id) {
             } else {
               message = 'Collapsing globally...';
             }
+            updateApplyDebugLine(id, '');
           } else {
           const done = data.processedLists || 0;
           const total = data.totalLists || 0;
@@ -241,6 +256,7 @@ function pollApplyStatus(id) {
           } else {
             message = 'Generating consolidated lists...';
           }
+          updateApplyDebugLine(id, '');
         }
         updateApplyStatusLine(id, message);
         showApplyFeedback('info', `Firewall ${id}: ${message}`);
@@ -250,6 +266,7 @@ function pollApplyStatus(id) {
 
       if (data.status === 'complete') {
         updateApplyStatusLine(id, `Completed: ${data.whitelistCount || 0} allow, ${data.blacklistCount || 0} deny`);
+        updateApplyDebugLine(id, '');
         showApplyFeedback('success', `Firewall ${id} apply completed. Refreshing status...`);
         stopApplyPolling(id);
         setTimeout(() => window.location.reload(), 1200);
@@ -259,6 +276,13 @@ function pollApplyStatus(id) {
       if (data.status === 'failed') {
         const error = data.lastError || 'apply failed';
         updateApplyStatusLine(id, `Failed: ${error}`);
+        updateApplyDebugLine(
+          id,
+          [
+            data.currentChunkText ? `cmd:\n${data.currentChunkText}` : '',
+            data.routerFeedback ? `feedback: ${data.routerFeedback}` : '',
+          ].filter(Boolean).join(' | ')
+        );
         showApplyFeedback('danger', `Firewall ${id} apply failed: ${error}`);
         stopApplyPolling(id);
         return;
@@ -266,6 +290,7 @@ function pollApplyStatus(id) {
 
       if (data.status === 'skipped') {
         updateApplyStatusLine(id, data.lastError || 'Skipped');
+        updateApplyDebugLine(id, '');
         showApplyFeedback('warning', `Firewall ${id}: ${data.lastError || 'Skipped'}`);
         stopApplyPolling(id);
       }

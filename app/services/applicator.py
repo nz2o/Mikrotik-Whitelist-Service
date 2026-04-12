@@ -15,6 +15,7 @@ import logging
 import socket
 import threading
 import time
+import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Optional
@@ -25,7 +26,16 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from app.config import APPLY_TIMEOUT_SECONDS, FETCH_RETRIES, configure_logging
 from app.crypto import decrypt_secret
 from app.database import SessionLocal
-from app.models import ApplyHistory, Configuration, Domain, DomainList, Firewall, IpAddress, IpList
+from app.models import (
+    ApplyHistory,
+    Configuration,
+    Domain,
+    DomainList,
+    Firewall,
+    FirewallAddressState,
+    IpAddress,
+    IpList,
+)
 
 log = logging.getLogger(__name__)
 
@@ -34,9 +44,18 @@ class _SshAuthError(Exception):
     """SSH authentication failure — retrying will not help."""
 
 
-CHUNK_SIZE = 500  # max CIDRs per RouterOS script chunk
+CHUNK_SIZE = 50  # balance command throughput with RouterOS execution latency
+MAX_CHUNK_BYTES = 5000  # keep chunks moderate; avoid long-running giant script payloads
+TTL_REFRESH_THRESHOLD_DAYS = 4
 _APPLY_STATUS_LOCK = threading.Lock()
 _APPLY_STATUS: dict[int, dict[str, object]] = {}
+IN_PROGRESS_APPLY_STATUSES = {
+    "starting",
+    "connecting",
+    "generating",
+    "collapsing",
+    "pushing",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -76,41 +95,37 @@ def _consolidate(cidrs: list[str]) -> list[str]:
 
 
 def _collapse_entries(entries: list[tuple[str, int]]) -> list[tuple[str, int]]:
-    """Collapse entries to minimal CIDRs while keeping effective TTL values.
+    """Collapse entries quickly while preserving per-TTL behavior.
 
-    TTL comes from list settings; if missing/invalid, default to DEFAULT_TTL_DAYS.
+    Strategy:
+    - Group by effective TTL and collapse each bucket independently.
+    - Merge exact duplicate networks across buckets using max TTL.
+
+    This avoids expensive cross-product subnet checks that can stall large exports
+    while still honoring list TTL defaults.
     """
     if not entries:
         return []
 
-    # Deduplicate exact networks and keep the longest effective TTL for each.
-    by_network: dict[str, int] = {}
+    ttl_groups: dict[int, list[ipaddress.IPv4Network]] = defaultdict(list)
     for cidr, ttl in entries:
         try:
             net = ipaddress.IPv4Network(cidr, strict=False)
-            key = str(net)
-            by_network[key] = max(by_network.get(key, 0), _normalize_ttl(ttl))
+            ttl_groups[_normalize_ttl(ttl)].append(net)
         except ValueError:
             log.warning("Skipping invalid CIDR during collapse", extra={"cidr": cidr})
 
-    if not by_network:
+    if not ttl_groups:
         return []
 
-    # Collapse all at once (highly optimized C code)
-    networks = [ipaddress.IPv4Network(cidr, strict=False) for cidr in by_network]
-    collapsed = list(ipaddress.collapse_addresses(networks))
+    # Collapse within each TTL bucket, then dedupe exact-network collisions.
+    by_network: dict[str, int] = {}
+    for effective_ttl, nets in ttl_groups.items():
+        for collapsed_net in ipaddress.collapse_addresses(nets):
+            key = str(collapsed_net)
+            by_network[key] = max(by_network.get(key, 0), effective_ttl)
 
-    # For each collapsed network, keep max TTL among member networks.
-    collapsed_ttl: dict[str, int] = {}
-    for original_cidr, ttl in by_network.items():
-        original_net = ipaddress.IPv4Network(original_cidr, strict=False)
-        for collapsed_net in collapsed:
-            if original_net.subnet_of(collapsed_net):
-                key = str(collapsed_net)
-                collapsed_ttl[key] = max(collapsed_ttl.get(key, 0), ttl)
-                break
-
-    return [(cidr, ttl) for cidr, ttl in collapsed_ttl.items()]
+    return [(cidr, ttl) for cidr, ttl in by_network.items()]
 
 
 def _update_apply_status(firewall_id: int, **updates) -> None:
@@ -239,37 +254,128 @@ def _sha256_of(entries: list[tuple[str, int]]) -> str:
     return hashlib.sha256(joined.encode()).hexdigest()
 
 
+def _routeros_address_literal(cidr: str) -> str:
+    """Return RouterOS-friendly canonical address literal."""
+    try:
+        net = ipaddress.IPv4Network(cidr, strict=False)
+        if net.prefixlen == 32:
+            return str(net.network_address)
+        return str(net)
+    except ValueError:
+        return cidr
+
+
+def _pack_script_units(units: list[list[str]]) -> list[str]:
+    """Pack multi-line units without splitting a unit across chunks."""
+    packed: list[str] = []
+    current_units: list[list[str]] = []
+    current_bytes = 0
+    for unit in units:
+        unit_text = "\n".join(unit) + "\n"
+        unit_bytes = len(unit_text.encode("utf-8"))
+        if current_units and current_bytes + unit_bytes > MAX_CHUNK_BYTES:
+            chunk_lines: list[str] = []
+            for u in current_units:
+                chunk_lines.extend(u)
+            packed.append("\n".join(chunk_lines) + "\n")
+            current_units = []
+            current_bytes = 0
+        current_units.append(unit)
+        current_bytes += unit_bytes
+    if current_units:
+        chunk_lines = []
+        for u in current_units:
+            chunk_lines.extend(u)
+        packed.append("\n".join(chunk_lines) + "\n")
+    return packed
+
+
 # ---------------------------------------------------------------------------
 # RouterOS script generation
 # ---------------------------------------------------------------------------
 
 
-def _make_rsc_chunks(list_name: str, entries: list[tuple[str, int]]) -> list[str]:
+def _make_rsc_chunks(
+    list_name: str,
+    entries: list[tuple[str, int]],
+    generation_tag: str | None = None,
+    safe_update: bool = False,
+) -> list[str]:
     """
-    Return a list of RouterOS script strings. The first chunk removes the
-    existing address list atomically, subsequent chunks append.
+    Return a list of RouterOS script strings.
+
+    safe_update=False (default):
+    - Fast export mode: remove then add entries in chunks.
+
+    safe_update=True:
+    - No-gap apply mode: upsert/tag desired entries, then prune stale entries.
+
+    No-gap mode keeps old entries in place until the new set is fully present.
+
     Each entry is a (cidr, ttl_days) tuple so different IP lists can carry
     different TTL values within the same RouterOS address list.
     Split into CHUNK_SIZE batches to avoid SSH/execution timeouts.
     """
     chunks: list[str] = []
+
+    if not safe_update:
+        all_lines: list[str] = []
+        for batch_index, start in enumerate(range(0, len(entries), CHUNK_SIZE)):
+            batch = entries[start : start + CHUNK_SIZE]
+            lines: list[str] = []
+            if batch_index == 0:
+                lines.append(f'/ip firewall address-list remove [find list="{list_name}"]')
+            for cidr, ttl in batch:
+                effective_ttl = _normalize_ttl(ttl)
+                ros_addr = _routeros_address_literal(cidr)
+                lines.append(
+                    f'/ip firewall address-list add list="{list_name}" '
+                    f'address={ros_addr} timeout={effective_ttl}d'
+                )
+            all_lines.extend(lines)
+
+        if not entries:
+            chunks = [f'/ip firewall address-list remove [find list="{list_name}"]\n']
+            return chunks
+        return _pack_script_units([[line] for line in all_lines])
+
+    if generation_tag is None:
+        generation_tag = f"mws-{int(time.time())}"
+
+    units: list[list[str]] = []
     for batch_index, start in enumerate(range(0, len(entries), CHUNK_SIZE)):
+        _ = batch_index
         batch = entries[start : start + CHUNK_SIZE]
-        lines: list[str] = []
-        if batch_index == 0:
-            # Atomic removal of old list before inserting new entries
-            lines.append(f'/ip firewall address-list remove [find list="{list_name}"]')
         for cidr, ttl in batch:
             effective_ttl = _normalize_ttl(ttl)
-            lines.append(
-                f'/ip firewall address-list add list="{list_name}" '
-                f'address={cidr} timeout={effective_ttl}d'
+            ros_addr = _routeros_address_literal(cidr)
+            units.append(
+                [
+                    f':do {{ /ip firewall address-list add list="{list_name}" '
+                    f'address={ros_addr} timeout={effective_ttl}d comment="{generation_tag}" }} '
+                    f'on-error={{ '
+                    f'/ip firewall address-list remove [find where list="{list_name}" and address={ros_addr}]; '
+                    f'/ip firewall address-list add list="{list_name}" address={ros_addr} timeout={effective_ttl}d comment="{generation_tag}" '
+                    f'}}',
+                ]
             )
-        chunks.append("\n".join(lines) + "\n")
-    # Edge case: if entries is empty, still remove old list
+
+    # Final prune pass removes stale entries only after all desired entries are present.
+    if entries:
+        units.append(
+            [
+                f':foreach i in=[/ip firewall address-list find list="{list_name}"] do={{ '
+                f':local c [/ip firewall address-list get $i comment]; '
+                f':if ((([:pick $c 0 4] = "mws:") and ($c != "{generation_tag}"))) do={{ /ip firewall address-list remove $i }} '
+                f'}}'
+            ]
+        )
+
+    # Edge case: if desired entries are empty, clear list.
     if not entries:
         chunks = [f'/ip firewall address-list remove [find list="{list_name}"]\n']
-    return chunks
+        return chunks
+    return _pack_script_units(units)
 
 
 def _kind_to_list_name(kind: str) -> str:
@@ -284,6 +390,146 @@ def _normalize_ttl(ttl_days: Optional[int]) -> int:
     if ttl_days < 1:
         return DEFAULT_TTL_DAYS
     return ttl_days
+
+
+def _remaining_ttl_days(ttl_days: int, last_pushed_at: datetime, now: datetime) -> float:
+    elapsed_seconds = (now - last_pushed_at).total_seconds()
+    return ttl_days - (elapsed_seconds / 86400.0)
+
+
+def _build_desired_entries_by_list(
+    datasets: dict[int, list[tuple[str, int]]]
+) -> dict[str, dict[str, int]]:
+    desired_by_list: dict[str, dict[str, int]] = {}
+    for code, _label in IpList.TYPE_OPTIONS:
+        list_name = TYPE_TO_LIST_NAME[code]
+        by_addr: dict[str, int] = {}
+        for cidr, ttl in datasets.get(code, []):
+            addr = _routeros_address_literal(cidr)
+            eff_ttl = _normalize_ttl(ttl)
+            by_addr[addr] = max(by_addr.get(addr, 0), eff_ttl)
+        desired_by_list[list_name] = by_addr
+    return desired_by_list
+
+
+def _plan_delta_units(
+    existing_rows: list[FirewallAddressState],
+    desired_by_list: dict[str, dict[str, int]],
+    generation_tag: str,
+    now: datetime,
+) -> tuple[list[list[str]], dict[tuple[str, str], tuple[int, int | None]], set[int]]:
+    """Plan incremental RouterOS operations and DB state changes.
+
+    Returns:
+    - script units to send
+    - upsert map key=(list_name, addr) -> (ttl_days, existing_row_id_or_none)
+    - row IDs to delete from state
+    """
+    existing_by_key = {(r.listName, r.ipAddress): r for r in existing_rows}
+    desired_keys = {
+        (list_name, addr)
+        for list_name, by_addr in desired_by_list.items()
+        for addr in by_addr.keys()
+    }
+
+    units: list[list[str]] = []
+    upserts: dict[tuple[str, str], tuple[int, int | None]] = {}
+    delete_ids: set[int] = set()
+
+    for list_name in desired_by_list.keys():
+        units.append(
+            [
+                f':foreach i in=[/ip firewall address-list find list="{list_name}"] do={{ '
+                f':local c [/ip firewall address-list get $i comment]; '
+                f':if (([:len $c] = 0) or ([:pick $c 0 4] != "mws:")) do={{ /ip firewall address-list remove $i }} '
+                f'}}'
+            ]
+        )
+
+    # Remove entries no longer desired.
+    for key, row in existing_by_key.items():
+        list_name, addr = key
+        if key not in desired_keys:
+            units.append(
+                [
+                    f':do {{ /ip firewall address-list remove [find where list="{list_name}" and address={addr}] }} on-error={{}}'
+                ]
+            )
+            delete_ids.add(row.id)
+
+    # Add or refresh entries that are new/changed/near expiry.
+    for list_name, by_addr in desired_by_list.items():
+        for addr, ttl_days in by_addr.items():
+            key = (list_name, addr)
+            row = existing_by_key.get(key)
+            needs_refresh = False
+            if row is None:
+                needs_refresh = True
+            else:
+                if row.ttlDays != ttl_days:
+                    needs_refresh = True
+                elif not row.generationTag or not row.generationTag.startswith("mws:"):
+                    needs_refresh = True
+                elif row.lastPushedAt is None:
+                    needs_refresh = True
+                else:
+                    remaining = _remaining_ttl_days(row.ttlDays, row.lastPushedAt, now)
+                    if remaining < TTL_REFRESH_THRESHOLD_DAYS:
+                        needs_refresh = True
+
+            if needs_refresh:
+                units.append(
+                    [
+                        f':do {{ /ip firewall address-list add list="{list_name}" '
+                        f'address={addr} timeout={ttl_days}d comment="{generation_tag}" }} '
+                        f'on-error={{ '
+                        f'/ip firewall address-list remove [find where list="{list_name}" and address={addr}]; '
+                        f'/ip firewall address-list add list="{list_name}" address={addr} timeout={ttl_days}d comment="{generation_tag}" '
+                        f'}}'
+                    ]
+                )
+                upserts[key] = (ttl_days, row.id if row else None)
+
+    return units, upserts, delete_ids
+
+
+def _apply_delta_state(
+    db,
+    firewall_id: int,
+    upserts: dict[tuple[str, str], tuple[int, int | None]],
+    delete_ids: set[int],
+    generation_tag: str,
+    now: datetime,
+) -> None:
+    if delete_ids:
+        db.query(FirewallAddressState).filter(FirewallAddressState.id.in_(list(delete_ids))).delete(
+            synchronize_session=False
+        )
+
+    for (list_name, addr), (ttl_days, row_id) in upserts.items():
+        if row_id is None:
+            db.add(
+                FirewallAddressState(
+                    firewallsId=firewall_id,
+                    listName=list_name,
+                    ipAddress=addr,
+                    ttlDays=ttl_days,
+                    generationTag=generation_tag,
+                    lastPushedAt=now,
+                    flagInactive=0,
+                )
+            )
+        else:
+            db.query(FirewallAddressState).filter(FirewallAddressState.id == row_id).update(
+                {
+                    "ttlDays": ttl_days,
+                    "generationTag": generation_tag,
+                    "lastPushedAt": now,
+                    "flagInactive": 0,
+                }
+            )
+
+    db.commit()
 
 
 def get_combined_entries(
@@ -329,7 +575,7 @@ def build_combined_rsc(kind: str) -> str:
         raise ValueError("unsupported kind")
     entries = datasets[KIND_TO_TYPE[kind]]
     list_name = _kind_to_list_name(kind)
-    return "".join(_make_rsc_chunks(list_name, entries))
+    return "".join(_make_rsc_chunks(list_name, entries, safe_update=False))
 
 
 def build_combined_plain(kind: str) -> str:
@@ -381,7 +627,7 @@ def build_iplist_rsc(iplist_id: int) -> str:
     list_type = iplist.flagBlacklist if iplist.flagBlacklist in TYPE_TO_LIST_NAME else IpList.TYPE_ALLOW
     list_name = TYPE_TO_LIST_NAME[list_type]
     entries = _get_iplist_entries(iplist_id)
-    return "".join(_make_rsc_chunks(list_name, entries))
+    return "".join(_make_rsc_chunks(list_name, entries, safe_update=False))
 
 
 def build_iplist_plain(iplist_id: int) -> str:
@@ -421,6 +667,9 @@ def _probe_ssh_port(fw: "Firewall", timeout: float) -> tuple[str | None, str | N
 def _push_chunks(fw: "Firewall", chunks: list[str], on_chunk_done=None) -> None:
     """Connect to firewall via SSH and execute all script chunks."""
     plaintext_secret = decrypt_secret(fw.firewallSecret)
+    # APPLY_TIMEOUT_SECONDS can be tuned low for connect/auth behavior, but
+    # RouterOS chunk execution may legitimately take longer on large lists.
+    chunk_timeout_seconds = max(APPLY_TIMEOUT_SECONDS, 60)
     try:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -443,13 +692,95 @@ def _push_chunks(fw: "Firewall", chunks: list[str], on_chunk_done=None) -> None:
             )
         total_chunks = len(chunks)
         for idx, chunk in enumerate(chunks, start=1):
-            stdin, stdout, stderr = client.exec_command(chunk, timeout=APPLY_TIMEOUT_SECONDS)
+            chunk_lines = [line.strip() for line in chunk.splitlines() if line.strip()]
+            chunk_preview = chunk_lines[0] if chunk_lines else ""
+            chunk_line_count = len(chunk_lines)
+            chunk_byte_size = len(chunk.encode("utf-8"))
+            if idx == 1 or idx % 20 == 0:
+                log.info(
+                    "Pushing chunk",
+                    extra={
+                        "firewallsId": fw.id,
+                        "chunk": idx,
+                        "totalChunks": total_chunks,
+                        "chunkTimeoutSeconds": chunk_timeout_seconds,
+                        "chunkPreview": chunk_preview,
+                        "chunkLineCount": chunk_line_count,
+                        "chunkBytes": chunk_byte_size,
+                    },
+                )
+            _update_apply_status(
+                fw.id,
+                currentChunk=idx,
+                currentChunkTotal=total_chunks,
+                currentChunkPreview=chunk_preview,
+                currentChunkText=chunk,
+                currentChunkLineCount=chunk_line_count,
+                currentChunkBytes=chunk_byte_size,
+                routerFeedback="sending chunk",
+            )
+            stdin, stdout, stderr = client.exec_command(chunk, timeout=chunk_timeout_seconds)
+            deadline = time.monotonic() + chunk_timeout_seconds
+            channel = stdout.channel
+            out_buf: list[str] = []
+            err_buf: list[str] = []
+            while not stdout.channel.exit_status_ready():
+                if channel.recv_ready():
+                    data = channel.recv(4096).decode(errors="replace")
+                    if data:
+                        out_buf.append(data)
+                        snippet = data.strip().splitlines()[-1][:220] if data.strip() else ""
+                        if snippet:
+                            _update_apply_status(
+                                fw.id,
+                                routerFeedback=f"stdout: {snippet[:500]}",
+                            )
+                            log.info(
+                                "RouterOS stdout",
+                                extra={
+                                    "firewallsId": fw.id,
+                                    "chunk": idx,
+                                    "message": snippet,
+                                },
+                            )
+                if channel.recv_stderr_ready():
+                    data = channel.recv_stderr(4096).decode(errors="replace")
+                    if data:
+                        err_buf.append(data)
+                        snippet = data.strip().splitlines()[-1][:220] if data.strip() else ""
+                        if snippet:
+                            _update_apply_status(
+                                fw.id,
+                                routerFeedback=f"stderr: {snippet[:500]}",
+                            )
+                            log.warning(
+                                "RouterOS stderr",
+                                extra={
+                                    "firewallsId": fw.id,
+                                    "chunk": idx,
+                                    "message": snippet,
+                                },
+                            )
+                if time.monotonic() > deadline:
+                    raise TimeoutError(
+                        f"RouterOS chunk {idx}/{total_chunks} timed out after {chunk_timeout_seconds}s"
+                    )
+                time.sleep(0.1)
+            while channel.recv_ready():
+                out_buf.append(channel.recv(4096).decode(errors="replace"))
+            while channel.recv_stderr_ready():
+                err_buf.append(channel.recv_stderr(4096).decode(errors="replace"))
             exit_code = stdout.channel.recv_exit_status()
-            err_output = stderr.read().decode().strip()
+            err_output = "".join(err_buf).strip() or stderr.read().decode(errors="replace").strip()
+            out_output = "".join(out_buf).strip()
             if exit_code != 0:
                 raise RuntimeError(
                     f"RouterOS command failed (exit {exit_code}): {err_output}"
                 )
+            _update_apply_status(
+                fw.id,
+                routerFeedback=(out_output or "ok")[:500],
+            )
             if on_chunk_done:
                 on_chunk_done(idx, total_chunks)
         client.close()
@@ -491,6 +822,13 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
             "totalBuckets": 0,
             "pushChunksDone": 0,
             "pushChunksTotal": 0,
+            "currentChunk": 0,
+            "currentChunkTotal": 0,
+            "currentChunkPreview": None,
+            "currentChunkText": None,
+            "currentChunkLineCount": 0,
+            "currentChunkBytes": 0,
+            "routerFeedback": None,
             "sourceIp": None,
             "lastError": None,
         }
@@ -610,8 +948,27 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
         wl_hash = _sha256_of(allow_entries)  # includes cidr+ttl in hash
         bl_hash = _sha256_of(other_entries)
 
+        now_utc = datetime.now(timezone.utc)
+        generation_tag = f"mws:{firewall_id}:{time.time_ns()}:{uuid.uuid4().hex[:10]}"
+        desired_by_list = _build_desired_entries_by_list(datasets)
+        existing_state_rows = (
+            db.query(FirewallAddressState)
+            .filter(
+                FirewallAddressState.firewallsId == firewall_id,
+                FirewallAddressState.flagInactive == 0,
+            )
+            .all()
+        )
+        delta_units, delta_upserts, delta_delete_ids = _plan_delta_units(
+            existing_rows=existing_state_rows,
+            desired_by_list=desired_by_list,
+            generation_tag=generation_tag,
+            now=now_utc,
+        )
+        all_chunks = _pack_script_units(delta_units)
+
         # Idempotency check (skipped when force=True)
-        if not force:
+        if not force and not all_chunks:
             last = (
                 db.query(ApplyHistory)
                 .filter(
@@ -650,11 +1007,6 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
             totalIpCount=total_ip_count,
         )
 
-        all_chunks: list[str] = []
-        for code, _label in IpList.TYPE_OPTIONS:
-            list_name = TYPE_TO_LIST_NAME[code]
-            all_chunks.extend(_make_rsc_chunks(list_name, datasets.get(code, [])))
-
         _update_history(db, record_id, status="pushing")
         _update_apply_status(
             firewall_id,
@@ -666,6 +1018,13 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
             totalIpCount=total_ip_count,
             pushChunksDone=0,
             pushChunksTotal=len(all_chunks),
+            currentChunk=0,
+            currentChunkTotal=len(all_chunks),
+            currentChunkPreview=None,
+            currentChunkText=None,
+            currentChunkLineCount=0,
+            currentChunkBytes=0,
+            routerFeedback="starting push",
             lastError=None,
         )
 
@@ -701,6 +1060,14 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
                     time.sleep(2 ** attempt)
 
         if pushed:
+            _apply_delta_state(
+                db,
+                firewall_id=firewall_id,
+                upserts=delta_upserts,
+                delete_ids=delta_delete_ids,
+                generation_tag=generation_tag,
+                now=now_utc,
+            )
             _update_history(
                 db,
                 record_id,
@@ -802,6 +1169,42 @@ def _update_history(db, record_id: int, **kwargs) -> None:
     db.commit()
 
 
+def reconcile_interrupted_applies(source: str = "startup") -> int:
+    """Mark stale in-progress apply rows as failed after service restart."""
+    db = SessionLocal()
+    try:
+        stale_ids = [
+            row.id
+            for row in db.query(ApplyHistory.id)
+            .filter(
+                ApplyHistory.status.in_(tuple(IN_PROGRESS_APPLY_STATUSES)),
+                ApplyHistory.completedAt.is_(None),
+            )
+            .all()
+        ]
+        if not stale_ids:
+            return 0
+
+        now_utc = datetime.now(timezone.utc)
+        reason = f"interrupted by service restart ({source})"
+        db.query(ApplyHistory).filter(ApplyHistory.id.in_(stale_ids)).update(
+            {
+                "status": "failed",
+                "completedAt": now_utc,
+                "errorMessage": reason,
+            },
+            synchronize_session=False,
+        )
+        db.commit()
+        log.warning(
+            "Reconciled interrupted applies",
+            extra={"count": len(stale_ids), "source": source},
+        )
+        return len(stale_ids)
+    finally:
+        db.close()
+
+
 # ---------------------------------------------------------------------------
 # Scheduler
 # ---------------------------------------------------------------------------
@@ -875,6 +1278,7 @@ def run() -> None:
     """Entry point for the applicator container."""
     configure_logging()
     log.info("Applicator service starting")
+    reconcile_interrupted_applies(source="applicator-startup")
 
     _scheduler.add_job(_schedule_check, "interval", seconds=60, id="schedule_check")
     _scheduler.start()

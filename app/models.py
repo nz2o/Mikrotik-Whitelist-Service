@@ -198,6 +198,41 @@ class Firewall(_StandardMixin, Base):
     applyHistory = relationship(
         "ApplyHistory", back_populates="firewall", cascade="all, delete-orphan"
     )
+    addressState = relationship(
+        "FirewallAddressState", back_populates="firewall", cascade="all, delete-orphan"
+    )
+
+
+# ---------------------------------------------------------------------------
+# firewallAddressState
+# ---------------------------------------------------------------------------
+
+
+class FirewallAddressState(_StandardMixin, Base):
+    __tablename__ = "firewallAddressState"
+    __table_args__ = (
+        Index("ix_firewallAddressState_flagInactive", "flagInactive"),
+        Index("ix_firewallAddressState_firewallsId", "firewallsId"),
+        Index(
+            "ux_firewallAddressState_firewall_list_addr",
+            "firewallsId",
+            "listName",
+            "ipAddress",
+            unique=True,
+        ),
+        {"schema": SCHEMA},
+    )
+
+    firewallsId = Column(
+        BigInteger, ForeignKey(f"{SCHEMA}.firewalls.id", ondelete="CASCADE"), nullable=False
+    )
+    listName = Column(Text, nullable=False)
+    ipAddress = Column(Text, nullable=False)
+    ttlDays = Column(Integer, nullable=False, default=7)
+    generationTag = Column(Text, nullable=False)
+    lastPushedAt = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+
+    firewall = relationship("Firewall", back_populates="addressState")
 
 
 # ---------------------------------------------------------------------------
