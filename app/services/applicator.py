@@ -147,22 +147,24 @@ def _build_datasets(on_list_done=None) -> dict[int, list[tuple[str, int]]]:
     t0 = time.perf_counter()
     db = SessionLocal()
     try:
-        active_lists = (
-            db.query(IpList)
+        active_lists = [
+            (row.id, row.ttlDays, row.flagBlacklist)
+            for row in db.query(IpList.id, IpList.ttlDays, IpList.flagBlacklist)
             .filter(IpList.flagInactive == 0)
             .all()
-        )
-        active_domain_lists = (
-            db.query(DomainList)
+        ]
+        active_domain_lists = [
+            (row.id, row.ttlDays, row.listType)
+            for row in db.query(DomainList.id, DomainList.ttlDays, DomainList.listType)
             .filter(DomainList.flagInactive == 0)
             .all()
-        )
+        ]
 
         # Bulk-load all active row data once, then group in-memory to avoid
         # N+1 query overhead when many lists are configured.
         ip_rows_by_list: dict[int, list[str]] = defaultdict(list)
         if active_lists:
-            active_ip_list_ids = [il.id for il in active_lists]
+            active_ip_list_ids = [list_id for list_id, _ttl, _list_type in active_lists]
             ip_rows = (
                 db.query(IpAddress.iplistsId, IpAddress.ipAddress)
                 .filter(
@@ -176,7 +178,7 @@ def _build_datasets(on_list_done=None) -> dict[int, list[tuple[str, int]]]:
 
         domain_rows_by_list: dict[int, list[str]] = defaultdict(list)
         if active_domain_lists:
-            active_domain_list_ids = [dl.id for dl in active_domain_lists]
+            active_domain_list_ids = [list_id for list_id, _ttl, _list_type in active_domain_lists]
             domain_rows = (
                 db.query(Domain.domainListsId, Domain.ipAddress)
                 .filter(
@@ -187,49 +189,49 @@ def _build_datasets(on_list_done=None) -> dict[int, list[tuple[str, int]]]:
             )
             for row in domain_rows:
                 domain_rows_by_list[row.domainListsId].append(row.ipAddress)
-
-        t_fetch = time.perf_counter()
-        total = len(active_lists) + len(active_domain_lists)
-        done = 0
-        datasets: dict[int, list[tuple[str, int]]] = {
-            code: [] for code, _label in IpList.TYPE_OPTIONS
-        }
-        for il in active_lists:
-            ttl = il.ttlDays if il.ttlDays is not None else DEFAULT_TTL_DAYS
-            list_type = il.flagBlacklist if il.flagBlacklist in datasets else IpList.TYPE_ALLOW
-            raw = ip_rows_by_list.get(il.id, [])
-            consolidated = _consolidate(raw)
-            entries = [(cidr, ttl) for cidr in consolidated]
-            datasets[list_type].extend(entries)
-            done += 1
-            if on_list_done:
-                on_list_done(done, total)
-
-        for dl in active_domain_lists:
-            ttl = dl.ttlDays if dl.ttlDays is not None else DEFAULT_TTL_DAYS
-            list_type = dl.listType if dl.listType in datasets else IpList.TYPE_ALLOW
-            raw = domain_rows_by_list.get(dl.id, [])
-            consolidated = _consolidate(raw)
-            entries = [(cidr, ttl) for cidr in consolidated]
-            datasets[list_type].extend(entries)
-            done += 1
-            if on_list_done:
-                on_list_done(done, total)
-        t_done = time.perf_counter()
-        log.info(
-            "Dataset build timings",
-            extra={
-                "ipLists": len(active_lists),
-                "domainLists": len(active_domain_lists),
-                "ipRows": sum(len(v) for v in ip_rows_by_list.values()),
-                "domainRows": sum(len(v) for v in domain_rows_by_list.values()),
-                "fetchSeconds": round(t_fetch - t0, 3),
-                "consolidateSeconds": round(t_done - t_fetch, 3),
-                "totalSeconds": round(t_done - t0, 3),
-            },
-        )
     finally:
         db.close()
+
+    t_fetch = time.perf_counter()
+    total = len(active_lists) + len(active_domain_lists)
+    done = 0
+    datasets: dict[int, list[tuple[str, int]]] = {
+        code: [] for code, _label in IpList.TYPE_OPTIONS
+    }
+    for list_id, ttl_days, list_flag in active_lists:
+        ttl = ttl_days if ttl_days is not None else DEFAULT_TTL_DAYS
+        list_type = list_flag if list_flag in datasets else IpList.TYPE_ALLOW
+        raw = ip_rows_by_list.get(list_id, [])
+        consolidated = _consolidate(raw)
+        entries = [(cidr, ttl) for cidr in consolidated]
+        datasets[list_type].extend(entries)
+        done += 1
+        if on_list_done:
+            on_list_done(done, total)
+
+    for list_id, ttl_days, list_kind in active_domain_lists:
+        ttl = ttl_days if ttl_days is not None else DEFAULT_TTL_DAYS
+        list_type = list_kind if list_kind in datasets else IpList.TYPE_ALLOW
+        raw = domain_rows_by_list.get(list_id, [])
+        consolidated = _consolidate(raw)
+        entries = [(cidr, ttl) for cidr in consolidated]
+        datasets[list_type].extend(entries)
+        done += 1
+        if on_list_done:
+            on_list_done(done, total)
+    t_done = time.perf_counter()
+    log.info(
+        "Dataset build timings",
+        extra={
+            "ipLists": len(active_lists),
+            "domainLists": len(active_domain_lists),
+            "ipRows": sum(len(v) for v in ip_rows_by_list.values()),
+            "domainRows": sum(len(v) for v in domain_rows_by_list.values()),
+            "fetchSeconds": round(t_fetch - t0, 3),
+            "consolidateSeconds": round(t_done - t_fetch, 3),
+            "totalSeconds": round(t_done - t0, 3),
+        },
+    )
 
     return datasets
 
