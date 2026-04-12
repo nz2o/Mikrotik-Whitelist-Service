@@ -15,6 +15,7 @@ import logging
 import socket
 import threading
 import time
+from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -143,6 +144,7 @@ def _build_datasets(on_list_done=None) -> dict[int, list[tuple[str, int]]]:
 
     on_list_done: optional callable(done: int, total: int) called after each list is processed.
     """
+    t0 = time.perf_counter()
     db = SessionLocal()
     try:
         active_lists = (
@@ -155,6 +157,38 @@ def _build_datasets(on_list_done=None) -> dict[int, list[tuple[str, int]]]:
             .filter(DomainList.flagInactive == 0)
             .all()
         )
+
+        # Bulk-load all active row data once, then group in-memory to avoid
+        # N+1 query overhead when many lists are configured.
+        ip_rows_by_list: dict[int, list[str]] = defaultdict(list)
+        if active_lists:
+            active_ip_list_ids = [il.id for il in active_lists]
+            ip_rows = (
+                db.query(IpAddress.iplistsId, IpAddress.ipAddress)
+                .filter(
+                    IpAddress.flagInactive == 0,
+                    IpAddress.iplistsId.in_(active_ip_list_ids),
+                )
+                .all()
+            )
+            for row in ip_rows:
+                ip_rows_by_list[row.iplistsId].append(row.ipAddress)
+
+        domain_rows_by_list: dict[int, list[str]] = defaultdict(list)
+        if active_domain_lists:
+            active_domain_list_ids = [dl.id for dl in active_domain_lists]
+            domain_rows = (
+                db.query(Domain.domainListsId, Domain.ipAddress)
+                .filter(
+                    Domain.flagInactive == 0,
+                    Domain.domainListsId.in_(active_domain_list_ids),
+                )
+                .all()
+            )
+            for row in domain_rows:
+                domain_rows_by_list[row.domainListsId].append(row.ipAddress)
+
+        t_fetch = time.perf_counter()
         total = len(active_lists) + len(active_domain_lists)
         done = 0
         datasets: dict[int, list[tuple[str, int]]] = {
@@ -163,15 +197,7 @@ def _build_datasets(on_list_done=None) -> dict[int, list[tuple[str, int]]]:
         for il in active_lists:
             ttl = il.ttlDays if il.ttlDays is not None else DEFAULT_TTL_DAYS
             list_type = il.flagBlacklist if il.flagBlacklist in datasets else IpList.TYPE_ALLOW
-            raw = [
-                r.ipAddress
-                for r in db.query(IpAddress.ipAddress)
-                .filter(
-                    IpAddress.iplistsId == il.id,
-                    IpAddress.flagInactive == 0,
-                )
-                .all()
-            ]
+            raw = ip_rows_by_list.get(il.id, [])
             consolidated = _consolidate(raw)
             entries = [(cidr, ttl) for cidr in consolidated]
             datasets[list_type].extend(entries)
@@ -182,21 +208,26 @@ def _build_datasets(on_list_done=None) -> dict[int, list[tuple[str, int]]]:
         for dl in active_domain_lists:
             ttl = dl.ttlDays if dl.ttlDays is not None else DEFAULT_TTL_DAYS
             list_type = dl.listType if dl.listType in datasets else IpList.TYPE_ALLOW
-            raw = [
-                r.ipAddress
-                for r in db.query(Domain.ipAddress)
-                .filter(
-                    Domain.domainListsId == dl.id,
-                    Domain.flagInactive == 0,
-                )
-                .all()
-            ]
+            raw = domain_rows_by_list.get(dl.id, [])
             consolidated = _consolidate(raw)
             entries = [(cidr, ttl) for cidr in consolidated]
             datasets[list_type].extend(entries)
             done += 1
             if on_list_done:
                 on_list_done(done, total)
+        t_done = time.perf_counter()
+        log.info(
+            "Dataset build timings",
+            extra={
+                "ipLists": len(active_lists),
+                "domainLists": len(active_domain_lists),
+                "ipRows": sum(len(v) for v in ip_rows_by_list.values()),
+                "domainRows": sum(len(v) for v in domain_rows_by_list.values()),
+                "fetchSeconds": round(t_fetch - t0, 3),
+                "consolidateSeconds": round(t_done - t_fetch, 3),
+                "totalSeconds": round(t_done - t0, 3),
+            },
+        )
     finally:
         db.close()
 
@@ -254,10 +285,34 @@ def _normalize_ttl(ttl_days: Optional[int]) -> int:
     return ttl_days
 
 
-def get_combined_entries(on_list_done=None) -> dict[int, list[tuple[str, int]]]:
+def get_combined_entries(
+    on_list_done=None,
+    on_collapse_started=None,
+    on_collapse_done=None,
+) -> dict[int, list[tuple[str, int]]]:
     """Public helper for export and apply consumers."""
+    t0 = time.perf_counter()
     datasets = _build_datasets(on_list_done=on_list_done)
-    return {list_type: _collapse_entries(entries) for list_type, entries in datasets.items()}
+    t_built = time.perf_counter()
+    collapsed: dict[int, list[tuple[str, int]]] = {}
+    total_buckets = len(datasets)
+    if on_collapse_started:
+        on_collapse_started(total_buckets)
+    for idx, (list_type, entries) in enumerate(datasets.items(), start=1):
+        collapsed[list_type] = _collapse_entries(entries)
+        if on_collapse_done:
+            on_collapse_done(idx, total_buckets)
+    t_done = time.perf_counter()
+    log.info(
+        "Global collapse timings",
+        extra={
+            "bucketCount": total_buckets,
+            "buildSeconds": round(t_built - t0, 3),
+            "collapseSeconds": round(t_done - t_built, 3),
+            "totalSeconds": round(t_done - t0, 3),
+        },
+    )
+    return collapsed
 
 
 def get_all_active_applies() -> list[dict]:
@@ -362,7 +417,7 @@ def _probe_ssh_port(fw: "Firewall", timeout: float) -> tuple[str | None, str | N
         return None, str(exc)
 
 
-def _push_chunks(fw: "Firewall", chunks: list[str]) -> None:
+def _push_chunks(fw: "Firewall", chunks: list[str], on_chunk_done=None) -> None:
     """Connect to firewall via SSH and execute all script chunks."""
     plaintext_secret = decrypt_secret(fw.firewallSecret)
     try:
@@ -385,7 +440,8 @@ def _push_chunks(fw: "Firewall", chunks: list[str]) -> None:
                 f"SSH authentication failed for {fw.firewallUser}@"
                 f"{fw.firewallAddress}:{fw.firewallPort} — check username/password"
             )
-        for chunk in chunks:
+        total_chunks = len(chunks)
+        for idx, chunk in enumerate(chunks, start=1):
             stdin, stdout, stderr = client.exec_command(chunk, timeout=APPLY_TIMEOUT_SECONDS)
             exit_code = stdout.channel.recv_exit_status()
             err_output = stderr.read().decode().strip()
@@ -393,6 +449,8 @@ def _push_chunks(fw: "Firewall", chunks: list[str]) -> None:
                 raise RuntimeError(
                     f"RouterOS command failed (exit {exit_code}): {err_output}"
                 )
+            if on_chunk_done:
+                on_chunk_done(idx, total_chunks)
         client.close()
     finally:
         # Ensure the plaintext is not held in memory after this point
@@ -426,6 +484,10 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
             "blacklistCount": 0,
             "processedLists": 0,
             "totalLists": 0,
+            "processedBuckets": 0,
+            "totalBuckets": 0,
+            "pushChunksDone": 0,
+            "pushChunksTotal": 0,
             "sourceIp": None,
             "lastError": None,
         }
@@ -508,11 +570,25 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
             sourceIp=source_ip,
             processedLists=0,
             totalLists=0,
+            processedBuckets=0,
+            totalBuckets=0,
         )
         datasets = get_combined_entries(
             on_list_done=lambda done, total: _update_apply_status(
                 firewall_id, processedLists=done, totalLists=total
-            )
+            ),
+            on_collapse_started=lambda total: _update_apply_status(
+                firewall_id,
+                status="collapsing",
+                processedBuckets=0,
+                totalBuckets=total,
+            ),
+            on_collapse_done=lambda done, total: _update_apply_status(
+                firewall_id,
+                status="collapsing",
+                processedBuckets=done,
+                totalBuckets=total,
+            ),
         )
         allow_entries = datasets.get(IpList.TYPE_ALLOW, [])
         other_entries = []
@@ -571,6 +647,8 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
             sourceIp=source_ip,
             whitelistCount=len(allow_entries),
             blacklistCount=len(other_entries),
+            pushChunksDone=0,
+            pushChunksTotal=len(all_chunks),
             lastError=None,
         )
 
@@ -578,7 +656,15 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
         pushed = False
         for attempt in range(1, FETCH_RETRIES + 1):
             try:
-                _push_chunks(fw, all_chunks)
+                _push_chunks(
+                    fw,
+                    all_chunks,
+                    on_chunk_done=lambda done, total: _update_apply_status(
+                        firewall_id,
+                        pushChunksDone=done,
+                        pushChunksTotal=total,
+                    ),
+                )
                 pushed = True
                 break
             except _SshAuthError as exc:
