@@ -383,6 +383,7 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
         }
 
     db = SessionLocal()
+    record_id: int | None = None
     try:
         fw = db.query(Firewall).filter(Firewall.id == firewall_id).first()
         if not fw:
@@ -405,6 +406,20 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
                 lastError="inactive firewall",
             )
             return
+
+        record = ApplyHistory(
+            firewallsId=firewall_id,
+            status="generating",
+            startedAt=datetime.now(timezone.utc),
+            whitelistHash=None,
+            blacklistHash=None,
+            whitelistCount=0,
+            blacklistCount=0,
+        )
+        db.add(record)
+        db.commit()
+        db.refresh(record)
+        record_id = record.id
 
         _update_apply_status(firewall_id, status="generating")
         datasets = get_combined_entries()
@@ -444,19 +459,14 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
                 )
                 return
 
-        record = ApplyHistory(
-            firewallsId=firewall_id,
-            status="generating",
-            startedAt=datetime.now(timezone.utc),
+        _update_history(
+            db,
+            record_id,
             whitelistHash=wl_hash,
             blacklistHash=bl_hash,
             whitelistCount=len(allow_entries),
             blacklistCount=len(other_entries),
         )
-        db.add(record)
-        db.commit()
-        db.refresh(record)
-        record_id = record.id
 
         all_chunks: list[str] = []
         for code, _label in IpList.TYPE_OPTIONS:
@@ -534,6 +544,17 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
                 extra={"firewallsId": firewall_id, "error": last_err},
             )
     except Exception as exc:
+        if record_id is not None:
+            try:
+                _update_history(
+                    db,
+                    record_id,
+                    status="failed",
+                    completedAt=datetime.now(timezone.utc),
+                    errorMessage=str(exc),
+                )
+            except Exception:
+                db.rollback()
         _update_apply_status(
             firewall_id,
             active=False,
@@ -541,6 +562,7 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
             finishedAt=datetime.now(timezone.utc).isoformat(),
             lastError=str(exc),
         )
+        log.exception("Unhandled apply failure", extra={"firewallsId": firewall_id})
         raise
     finally:
         db.close()
