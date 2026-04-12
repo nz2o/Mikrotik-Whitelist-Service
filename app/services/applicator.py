@@ -76,43 +76,33 @@ def _consolidate(cidrs: list[str]) -> list[str]:
 
 
 def _collapse_entries(entries: list[tuple[str, int]]) -> list[tuple[str, int]]:
-    """Safely collapse combined entries while preserving TTL semantics.
-
-    Rules:
-    - Collapse globally within identical TTL buckets.
-    - For exact duplicate CIDRs across TTLs, keep the longest TTL.
-    - Drop a narrower CIDR only when it is already covered by a broader CIDR
-      with an equal or longer TTL.
+    """Collapse combined entries to minimal set of non-overlapping CIDRs.
+    
+    Since every push replaces the entire list, TTL semantics don't need to be 
+    preserved across different sources. Just deduplicate and supernet-collapse all CIDRs.
+    Returns all collapsed networks with a default TTL of 0 (immaterial since replaced on next push).
     """
-    ttl_groups: dict[int, list[str]] = {}
-    for cidr, ttl in entries:
-        ttl_groups.setdefault(ttl, []).append(cidr)
-
-    by_network: dict[str, int] = {}
-    for ttl, cidrs in ttl_groups.items():
-        for collapsed_cidr in _consolidate(cidrs):
-            by_network[collapsed_cidr] = max(ttl, by_network.get(collapsed_cidr, 0))
-
-    ordered = sorted(
-        (
-            (ipaddress.IPv4Network(cidr, strict=False), ttl)
-            for cidr, ttl in by_network.items()
-        ),
-        key=lambda item: (item[0].prefixlen, int(item[0].network_address)),
-    )
-
-    result: list[tuple[ipaddress.IPv4Network, int]] = []
-    for network, ttl in ordered:
-        covered = False
-        for existing_network, existing_ttl in result:
-            if network.subnet_of(existing_network) and existing_ttl >= ttl:
-                covered = True
-                break
-        if covered:
-            continue
-        result.append((network, ttl))
-
-    return [(str(network), ttl) for network, ttl in result]
+    if not entries:
+        return []
+    
+    # Extract unique CIDRs and parse as networks
+    unique_cidrs = set()
+    for cidr, _ttl in entries:
+        try:
+            net = ipaddress.IPv4Network(cidr, strict=False)
+            unique_cidrs.add(str(net))
+        except ValueError:
+            log.warning("Skipping invalid CIDR during collapse", extra={"cidr": cidr})
+    
+    if not unique_cidrs:
+        return []
+    
+    # Collapse all at once (highly optimized C code)
+    networks = [ipaddress.IPv4Network(cidr, strict=False) for cidr in unique_cidrs]
+    collapsed = list(ipaddress.collapse_addresses(networks))
+    
+    # Return with default TTL (irrelevant since entire list is replaced each push)
+    return [(str(net), 0) for net in collapsed]
 
 
 def _update_apply_status(firewall_id: int, **updates) -> None:
