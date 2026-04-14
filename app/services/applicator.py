@@ -33,6 +33,7 @@ from app.models import (
     DomainList,
     Firewall,
     FirewallAddressState,
+    FirewallListState,
     IpAddress,
     IpList,
 )
@@ -436,6 +437,38 @@ def _build_desired_entries_by_list(
     return desired_by_list
 
 
+def _compute_list_hash(addresses: dict[str, int]) -> str:
+    """Compute SHA256 hash of sorted address list for change detection."""
+    sorted_addrs = sorted(addresses.keys())
+    content = "\n".join(sorted_addrs)
+    return hashlib.sha256(content.encode()).hexdigest()
+
+
+def _get_changed_lists(
+    db,
+    firewall_id: int,
+    desired_by_list: dict[str, dict[str, int]],
+) -> set[str]:
+    """Identify which lists have changed (hash mismatch) since last push.
+    
+    Returns: set of list names that need to be re-pushed.
+    """
+    existing_rows = (
+        db.query(FirewallListState)
+        .filter(FirewallListState.firewallsId == firewall_id)
+        .all()
+    )
+    existing_hashes = {r.listName: r.contentHash for r in existing_rows}
+
+    changed = set()
+    for list_name, addresses in desired_by_list.items():
+        desired_hash = _compute_list_hash(addresses)
+        if existing_hashes.get(list_name) != desired_hash:
+            changed.add(list_name)
+
+    return changed
+
+
 def _plan_delta_units(
     existing_rows: list[FirewallAddressState],
     desired_by_list: dict[str, dict[str, int]],
@@ -487,16 +520,26 @@ def _plan_delta_units(
                         needs_refresh = True
 
             if needs_refresh:
-                add_or_refresh_units.append(
-                    [
-                        f':do {{ /ip firewall address-list add list="{list_name}" '
-                        f'address={addr} timeout={ttl_days}d comment="{generation_tag}" }} '
-                        f'on-error={{ '
-                        f'/ip firewall address-list remove [find where list="{list_name}" and address={addr}]; '
-                        f'/ip firewall address-list add list="{list_name}" address={addr} timeout={ttl_days}d comment="{generation_tag}" '
-                        f'}}'
-                    ]
-                )
+                if row is None:
+                    # New key: keep the command cheap; ignore duplicate races safely.
+                    add_or_refresh_units.append(
+                        [
+                            f':do {{ /ip firewall address-list add list="{list_name}" '
+                            f'address={addr} timeout={ttl_days}d comment="{generation_tag}" }} on-error={{}}'
+                        ]
+                    )
+                else:
+                    # Existing key needs refresh/repair: remove and re-add deterministically.
+                    add_or_refresh_units.append(
+                        [
+                            f':do {{ /ip firewall address-list add list="{list_name}" '
+                            f'address={addr} timeout={ttl_days}d comment="{generation_tag}" }} '
+                            f'on-error={{ '
+                            f'/ip firewall address-list remove [find where list="{list_name}" and address={addr}]; '
+                            f'/ip firewall address-list add list="{list_name}" address={addr} timeout={ttl_days}d comment="{generation_tag}" '
+                            f'}}'
+                        ]
+                    )
                 upserts[key] = (ttl_days, row.id if row else None)
 
     delete_ids: set[int] = set()
@@ -550,6 +593,52 @@ def _apply_delta_state(
                 }
             )
 
+    db.commit()
+
+
+def _update_list_state_hashes(
+    db,
+    firewall_id: int,
+    desired_by_list: dict[str, dict[str, int]],
+    now: datetime,
+) -> None:
+    """Update FirewallListState hashes after a successful push."""
+    for list_name, addresses in desired_by_list.items():
+        content_hash = _compute_list_hash(addresses)
+        entry_count = len(addresses)
+        
+        existing = (
+            db.query(FirewallListState)
+            .filter(
+                FirewallListState.firewallsId == firewall_id,
+                FirewallListState.listName == list_name,
+            )
+            .first()
+        )
+        
+        if existing:
+            db.query(FirewallListState).filter(
+                FirewallListState.firewallsId == firewall_id,
+                FirewallListState.listName == list_name,
+            ).update(
+                {
+                    "contentHash": content_hash,
+                    "entryCount": entry_count,
+                    "lastPushedAt": now,
+                    "flagInactive": 0,
+                }
+            )
+        else:
+            db.add(
+                FirewallListState(
+                    firewallsId=firewall_id,
+                    listName=list_name,
+                    contentHash=content_hash,
+                    entryCount=entry_count,
+                    lastPushedAt=now,
+                    flagInactive=0,
+                )
+            )
     db.commit()
 
 
@@ -1076,26 +1165,111 @@ def apply_firewall(
         now_utc = datetime.now(timezone.utc)
         generation_tag = f"mws:{firewall_id}:{time.time_ns()}:{uuid.uuid4().hex[:10]}"
         desired_by_list = _build_desired_entries_by_list(datasets)
+
+        existing_list_state_count = (
+            db.query(FirewallListState.id)
+            .filter(
+                FirewallListState.firewallsId == firewall_id,
+                FirewallListState.flagInactive == 0,
+            )
+            .count()
+        )
+        existing_state_count_all = (
+            db.query(FirewallAddressState.id)
+            .filter(
+                FirewallAddressState.firewallsId == firewall_id,
+                FirewallAddressState.flagInactive == 0,
+            )
+            .count()
+        )
+
+        managed_count = _get_router_managed_entry_count(fw)
+        if existing_list_state_count == 0 and existing_state_count_all > 0 and (managed_count or 0) > 0:
+            _update_list_state_hashes(
+                db,
+                firewall_id=firewall_id,
+                desired_by_list=desired_by_list,
+                now=now_utc,
+            )
+            _update_history(
+                db,
+                record_id,
+                status="skipped",
+                completedAt=datetime.now(timezone.utc),
+                errorMessage="initialized list hash state from existing router/state; no push needed",
+            )
+            _update_apply_status(
+                firewall_id,
+                active=False,
+                status="skipped",
+                finishedAt=datetime.now(timezone.utc).isoformat(),
+                lastError="initialized list hash state from existing router/state",
+            )
+            log.info(
+                "Initialized list hash state from existing router/state; skipped push",
+                extra={
+                    "firewallsId": firewall_id,
+                    "stateRows": existing_state_count_all,
+                    "routerManagedCount": managed_count,
+                },
+            )
+            return
+        
+        # Check which lists have actually changed since last push (hash-based).
+        # Skip unchanged lists entirely to save CPU on collapse/push operations.
+        changed_lists = _get_changed_lists(db, firewall_id, desired_by_list)
+        if not changed_lists:
+            log.info(
+                "Skipping apply: no lists have changed since last push",
+                extra={"firewallsId": firewall_id},
+            )
+            _update_apply_status(
+                firewall_id,
+                active=False,
+                status="skipped",
+                finishedAt=datetime.now(timezone.utc).isoformat(),
+                lastError="no lists changed since last push",
+            )
+            return
+
+        desired_by_list_for_apply = {
+            list_name: entries
+            for list_name, entries in desired_by_list.items()
+            if list_name in changed_lists
+        }
+        
+        log.info(
+            "Detected list changes; proceeding with push",
+            extra={
+                "firewallsId": firewall_id,
+                "changedLists": sorted(changed_lists),
+                "totalLists": len(desired_by_list),
+            },
+        )
+        
         existing_state_rows = (
             db.query(FirewallAddressState)
             .filter(
                 FirewallAddressState.firewallsId == firewall_id,
                 FirewallAddressState.flagInactive == 0,
+                FirewallAddressState.listName.in_(list(desired_by_list_for_apply.keys())),
             )
             .all()
         )
 
+        existing_state_count = existing_state_count_all
+
         # If router reboot/power loss cleared dynamic lists, local delta state is stale.
         # Detect this by probing router-side managed entry count and reseed from scratch.
-        managed_count = _get_router_managed_entry_count(fw)
-        if existing_state_rows and managed_count == 0:
-            stale_count = len(existing_state_rows)
+        if existing_state_count > 0 and managed_count == 0:
+            stale_count = existing_state_count
             db.query(FirewallAddressState).filter(
                 FirewallAddressState.firewallsId == firewall_id,
                 FirewallAddressState.flagInactive == 0,
             ).delete(synchronize_session=False)
             db.commit()
             existing_state_rows = []
+            desired_by_list_for_apply = desired_by_list
             _update_apply_status(
                 firewall_id,
                 routerFeedback="router dynamic lists appear reset; reseeding full state",
@@ -1110,7 +1284,7 @@ def apply_firewall(
 
         delta_units, delta_upserts, delta_delete_ids, deferred_delete_count = _plan_delta_units(
             existing_rows=existing_state_rows,
-            desired_by_list=desired_by_list,
+            desired_by_list=desired_by_list_for_apply,
             generation_tag=generation_tag,
             now=now_utc,
         )
@@ -1225,6 +1399,13 @@ def apply_firewall(
                 upserts=delta_upserts,
                 delete_ids=delta_delete_ids,
                 generation_tag=generation_tag,
+                now=now_utc,
+            )
+            # Update list state hashes so we skip unchanged lists on next apply
+            _update_list_state_hashes(
+                db,
+                firewall_id=firewall_id,
+                desired_by_list=desired_by_list_for_apply,
                 now=now_utc,
             )
             _update_history(

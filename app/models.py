@@ -201,6 +201,9 @@ class Firewall(_StandardMixin, Base):
     addressState = relationship(
         "FirewallAddressState", back_populates="firewall", cascade="all, delete-orphan"
     )
+    listState = relationship(
+        "FirewallListState", back_populates="firewall", cascade="all, delete-orphan"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +236,37 @@ class FirewallAddressState(_StandardMixin, Base):
     lastPushedAt = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
     firewall = relationship("Firewall", back_populates="addressState")
+
+
+class FirewallListState(_StandardMixin, Base):
+    """Tracks consolidated list state by hash to enable efficient delta detection.
+    
+    Instead of storing per-IP state (which can be millions of rows), we store
+    a hash of each list's consolidated content. If the hash changes, the list
+    needs to be re-pushed to the router.
+    """
+    __tablename__ = "firewallListState"
+    __table_args__ = (
+        Index("ix_firewallListState_flagInactive", "flagInactive"),
+        Index("ix_firewallListState_firewallsId", "firewallsId"),
+        Index(
+            "ux_firewallListState_firewall_listname",
+            "firewallsId",
+            "listName",
+            unique=True,
+        ),
+        {"schema": SCHEMA},
+    )
+
+    firewallsId = Column(
+        BigInteger, ForeignKey(f"{SCHEMA}.firewalls.id", ondelete="CASCADE"), nullable=False
+    )
+    listName = Column(Text, nullable=False)  # e.g. "ip-whitelist-dynamic"
+    contentHash = Column(Text, nullable=False)  # SHA256 of sorted consolidated list
+    entryCount = Column(Integer, nullable=False, default=0)
+    lastPushedAt = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+
+    firewall = relationship("Firewall", back_populates="listState")
 
 
 # ---------------------------------------------------------------------------
