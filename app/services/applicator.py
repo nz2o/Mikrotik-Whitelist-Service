@@ -156,12 +156,20 @@ def get_apply_status(firewall_id: int) -> dict[str, object]:
         return dict(_APPLY_STATUS.get(firewall_id, {}))
 
 
-def trigger_apply_async(firewall_id: int, force: bool = False) -> bool:
+def trigger_apply_async(
+    firewall_id: int,
+    force: bool = False,
+    override_in_progress: bool = False,
+) -> bool:
     with _APPLY_STATUS_LOCK:
         current = _APPLY_STATUS.get(firewall_id, {})
         if current.get("active"):
             return False
-    threading.Thread(target=apply_firewall, args=(firewall_id, force), daemon=True).start()
+    threading.Thread(
+        target=apply_firewall,
+        args=(firewall_id, force, override_in_progress),
+        daemon=True,
+    ).start()
     return True
 
 
@@ -802,12 +810,64 @@ def _push_chunks(fw: "Firewall", chunks: list[str], on_chunk_done=None) -> None:
         del plaintext_secret
 
 
+def _get_router_managed_entry_count(fw: "Firewall") -> int | None:
+    """Return count of router entries tagged with mws:, or None if probe fails."""
+    plaintext_secret = decrypt_secret(fw.firewallSecret)
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            client.connect(
+                hostname=fw.firewallAddress,
+                port=fw.firewallPort,
+                username=fw.firewallUser,
+                password=plaintext_secret,
+                timeout=APPLY_TIMEOUT_SECONDS,
+                auth_timeout=APPLY_TIMEOUT_SECONDS,
+                banner_timeout=APPLY_TIMEOUT_SECONDS,
+                look_for_keys=False,
+                allow_agent=False,
+            )
+        except paramiko.AuthenticationException:
+            raise _SshAuthError(
+                f"SSH authentication failed for {fw.firewallUser}@"
+                f"{fw.firewallAddress}:{fw.firewallPort} — check username/password"
+            )
+
+        cmd = ':put [:len [/ip firewall address-list find where comment~"^mws:"]]'
+        _stdin, stdout, stderr = client.exec_command(cmd, timeout=max(APPLY_TIMEOUT_SECONDS, 20))
+        exit_code = stdout.channel.recv_exit_status()
+        if exit_code != 0:
+            err_output = stderr.read().decode(errors="replace").strip()
+            log.warning(
+                "Managed entry probe failed",
+                extra={"firewallsId": fw.id, "error": err_output},
+            )
+            return None
+        out = stdout.read().decode(errors="replace").strip()
+        for line in reversed(out.splitlines()):
+            line = line.strip()
+            if line.isdigit():
+                return int(line)
+        return None
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+        del plaintext_secret
+
+
 # ---------------------------------------------------------------------------
 # Apply lifecycle
 # ---------------------------------------------------------------------------
 
 
-def apply_firewall(firewall_id: int, force: bool = False) -> None:
+def apply_firewall(
+    firewall_id: int,
+    force: bool = False,
+    override_in_progress: bool = False,
+) -> None:
     """Apply address lists to a single firewall.
     
     Args:
@@ -870,6 +930,58 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
                 lastError="inactive firewall",
             )
             return
+
+        # Cross-process guard: another container (e.g. applicator vs api) may have
+        # started an apply for this firewall that the in-memory _APPLY_STATUS does not
+        # know about.  Check the DB before creating a new history record.
+        existing_in_progress = (
+            db.query(ApplyHistory.id)
+            .filter(
+                ApplyHistory.firewallsId == firewall_id,
+                ApplyHistory.status.in_(tuple(IN_PROGRESS_APPLY_STATUSES)),
+                ApplyHistory.completedAt.is_(None),
+            )
+            .first()
+        )
+        if existing_in_progress is not None:
+            if not override_in_progress:
+                log.info(
+                    "Apply already in progress (cross-process guard)",
+                    extra={
+                        "firewallsId": firewall_id,
+                        "existingRecordId": existing_in_progress.id,
+                    },
+                )
+                _update_apply_status(
+                    firewall_id,
+                    active=False,
+                    status="skipped",
+                    finishedAt=datetime.now(timezone.utc).isoformat(),
+                    lastError="apply already in progress in another process",
+                )
+                return
+
+            now = datetime.now(timezone.utc)
+            db.query(ApplyHistory).filter(
+                ApplyHistory.firewallsId == firewall_id,
+                ApplyHistory.status.in_(tuple(IN_PROGRESS_APPLY_STATUSES)),
+                ApplyHistory.completedAt.is_(None),
+            ).update(
+                {
+                    ApplyHistory.status: "failed",
+                    ApplyHistory.completedAt: now,
+                    ApplyHistory.errorMessage: "overridden by manual force apply",
+                },
+                synchronize_session=False,
+            )
+            db.commit()
+            log.warning(
+                "Override in-progress guard and continue apply",
+                extra={
+                    "firewallsId": firewall_id,
+                    "existingRecordId": existing_in_progress.id,
+                },
+            )
 
         record = ApplyHistory(
             firewallsId=firewall_id,
@@ -972,6 +1084,30 @@ def apply_firewall(firewall_id: int, force: bool = False) -> None:
             )
             .all()
         )
+
+        # If router reboot/power loss cleared dynamic lists, local delta state is stale.
+        # Detect this by probing router-side managed entry count and reseed from scratch.
+        managed_count = _get_router_managed_entry_count(fw)
+        if existing_state_rows and managed_count == 0:
+            stale_count = len(existing_state_rows)
+            db.query(FirewallAddressState).filter(
+                FirewallAddressState.firewallsId == firewall_id,
+                FirewallAddressState.flagInactive == 0,
+            ).delete(synchronize_session=False)
+            db.commit()
+            existing_state_rows = []
+            _update_apply_status(
+                firewall_id,
+                routerFeedback="router dynamic lists appear reset; reseeding full state",
+            )
+            log.warning(
+                "Detected router-side dynamic list reset; forcing full reseed",
+                extra={
+                    "firewallsId": firewall_id,
+                    "clearedLocalStateRows": stale_count,
+                },
+            )
+
         delta_units, delta_upserts, delta_delete_ids, deferred_delete_count = _plan_delta_units(
             existing_rows=existing_state_rows,
             desired_by_list=desired_by_list,

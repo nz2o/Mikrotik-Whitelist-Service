@@ -2,7 +2,7 @@
 
 import threading
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 
 from app.services import applicator as applicator_svc
 from app.services import fetcher as fetcher_svc
@@ -68,12 +68,20 @@ def trigger_apply_all():
 
 
 @router.post("/apply/{firewall_id}")
-def trigger_apply_one(firewall_id: int):
+def trigger_apply_one(
+    firewall_id: int,
+    override_in_progress: bool = Query(False, alias="overrideInProgress"),
+):
     """Trigger an immediate apply to a specific firewall (bypasses idempotency)."""
-    started = applicator_svc.trigger_apply_async(firewall_id, True)
+    started = applicator_svc.trigger_apply_async(
+        firewall_id,
+        True,
+        override_in_progress=override_in_progress,
+    )
     return {
         "status": "triggered" if started else "already-running",
         "firewallsId": firewall_id,
+        "overrideInProgress": override_in_progress,
     }
 
 

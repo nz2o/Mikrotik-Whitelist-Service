@@ -61,6 +61,10 @@
                 onclick="triggerApply({{ fw.id }}, this)">
           <i class="bi bi-send"></i>
         </button>
+        <button class="btn btn-sm btn-outline-warning" title="Force Apply (override stuck in-progress lock)"
+                onclick="triggerApply({{ fw.id }}, this, true)">
+          <i class="bi bi-lightning-charge"></i>
+        </button>
         <form method="post" action="/firewalls/{{ fw.id }}/delete"
               onsubmit="return confirm('Delete firewall {{ fw.firewallAddress }}?')">
           <button type="submit" class="btn btn-sm btn-outline-danger" title="Delete">
@@ -301,15 +305,26 @@ function pollApplyStatus(id) {
     });
 }
 
-function triggerApply(id, btn) {
+function triggerApply(id, btn, overrideInProgress = false) {
+  if (overrideInProgress) {
+    const ok = window.confirm(
+      `Force apply firewall ${id}? This overrides the in-progress lock and marks previous in-progress records as failed.`
+    );
+    if (!ok) {
+      return;
+    }
+  }
   btn.disabled = true;
   const originalHtml = btn.innerHTML;
   btn.innerHTML = '<i class="bi bi-hourglass-split"></i>';
-  fetch(`/internal/apply/${id}`, {method: 'POST'})
+  const params = overrideInProgress ? '?overrideInProgress=true' : '';
+  fetch(`/internal/apply/${id}${params}`, {method: 'POST'})
     .then((response) => response.json())
     .then((data) => {
       if (data.status === 'already-running') {
         showApplyFeedback('info', `Firewall ${id} is already applying.`);
+      } else if (overrideInProgress) {
+        showApplyFeedback('warning', `Firewall ${id} force apply started (in-progress lock overridden).`);
       } else {
         showApplyFeedback('info', `Firewall ${id} apply started.`);
       }
