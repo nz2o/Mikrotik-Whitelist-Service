@@ -45,10 +45,11 @@ class _SshAuthError(Exception):
     """SSH authentication failure — retrying will not help."""
 
 
-CHUNK_SIZE = 50  # balance command throughput with RouterOS execution latency
-MAX_CHUNK_BYTES = 5000  # keep chunks moderate; avoid long-running giant script payloads
+CHUNK_SIZE = 30  # reduced for faster RouterOS execution; prioritize latency over throughput
+MAX_CHUNK_BYTES = 2000  # keep chunks small for better RouterOS responsiveness
 TTL_REFRESH_THRESHOLD_DAYS = 4
 MAX_DELETE_OPS_PER_APPLY = 300
+CHUNK_WARN_THRESHOLD_SECONDS = 30  # log warning if chunk execution exceeds this
 _APPLY_STATUS_LOCK = threading.Lock()
 _APPLY_STATUS: dict[int, dict[str, object]] = {}
 IN_PROGRESS_APPLY_STATUSES = {
@@ -779,7 +780,7 @@ def _push_chunks(fw: "Firewall", chunks: list[str], on_chunk_done=None) -> None:
     plaintext_secret = decrypt_secret(fw.firewallSecret)
     # APPLY_TIMEOUT_SECONDS can be tuned low for connect/auth behavior, but
     # RouterOS chunk execution may legitimately take longer on large lists.
-    chunk_timeout_seconds = max(APPLY_TIMEOUT_SECONDS, 60)
+    chunk_timeout_seconds = max(APPLY_TIMEOUT_SECONDS, 90)  # floor for individual chunk execution
     try:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -802,6 +803,7 @@ def _push_chunks(fw: "Firewall", chunks: list[str], on_chunk_done=None) -> None:
             )
         total_chunks = len(chunks)
         for idx, chunk in enumerate(chunks, start=1):
+            chunk_start_time = time.monotonic()
             chunk_lines = [line.strip() for line in chunk.splitlines() if line.strip()]
             chunk_preview = chunk_lines[0] if chunk_lines else ""
             chunk_line_count = len(chunk_lines)
@@ -881,8 +883,21 @@ def _push_chunks(fw: "Firewall", chunks: list[str], on_chunk_done=None) -> None:
             while channel.recv_stderr_ready():
                 err_buf.append(channel.recv_stderr(4096).decode(errors="replace"))
             exit_code = stdout.channel.recv_exit_status()
+            chunk_elapsed = time.monotonic() - chunk_start_time
             err_output = "".join(err_buf).strip() or stderr.read().decode(errors="replace").strip()
             out_output = "".join(out_buf).strip()
+            if chunk_elapsed > 30:
+                log.warning(
+                    "Slow chunk execution",
+                    extra={
+                        "firewallsId": fw.id,
+                        "chunk": idx,
+                        "totalChunks": total_chunks,
+                        "elapsedSeconds": round(chunk_elapsed, 2),
+                        "chunkLineCount": chunk_line_count,
+                        "chunkBytes": chunk_byte_size,
+                    },
+                )
             if exit_code != 0:
                 raise RuntimeError(
                     f"RouterOS command failed (exit {exit_code}): {err_output}"
