@@ -22,6 +22,7 @@ from typing import Optional
 
 import paramiko
 from apscheduler.schedulers.background import BackgroundScheduler
+from sqlalchemy import func
 
 from app.config import APPLY_TIMEOUT_SECONDS, FETCH_RETRIES, configure_logging
 from app.crypto import decrypt_secret
@@ -62,6 +63,114 @@ IN_PROGRESS_APPLY_STATUSES = {
 }
 
 
+def _source_fingerprint_config_key(firewall_id: int) -> str:
+    return f"applicator.sourceFingerprint.firewall.{firewall_id}"
+
+
+def _read_config_value(db, key: str) -> str | None:
+    row = db.query(Configuration).filter(Configuration.configurationItem == key).first()
+    if row is None:
+        return None
+    return row.configurationItemValue
+
+
+def _write_config_value(db, key: str, value: str) -> None:
+    row = db.query(Configuration).filter(Configuration.configurationItem == key).first()
+    if row is None:
+        db.add(
+            Configuration(
+                configurationItem=key,
+                configurationHelp="internal applicator source fingerprint",
+                configurationItemValue=value,
+                flagInactive=0,
+            )
+        )
+    else:
+        row.configurationItemValue = value
+        row.flagInactive = 0
+    db.commit()
+
+
+def _compute_source_fingerprint(db) -> tuple[str, dict[str, object]]:
+    """Return a stable fingerprint for source rows used to build collapsed datasets."""
+
+    ip_list_count = (
+        db.query(func.count(IpList.id))
+        .filter(IpList.flagInactive == 0)
+        .scalar()
+        or 0
+    )
+    domain_list_count = (
+        db.query(func.count(DomainList.id))
+        .filter(DomainList.flagInactive == 0)
+        .scalar()
+        or 0
+    )
+    ip_count = (
+        db.query(func.count(IpAddress.id))
+        .filter(IpAddress.flagInactive == 0)
+        .scalar()
+        or 0
+    )
+    domain_count = (
+        db.query(func.count(Domain.id))
+        .filter(Domain.flagInactive == 0)
+        .scalar()
+        or 0
+    )
+
+    max_ip_list_update = (
+        db.query(func.max(IpList.updateDate))
+        .filter(IpList.flagInactive == 0)
+        .scalar()
+    )
+    max_domain_list_update = (
+        db.query(func.max(DomainList.updateDate))
+        .filter(DomainList.flagInactive == 0)
+        .scalar()
+    )
+    max_ip_update = (
+        db.query(func.max(IpAddress.updateDate))
+        .filter(IpAddress.flagInactive == 0)
+        .scalar()
+    )
+    max_domain_update = (
+        db.query(func.max(Domain.updateDate))
+        .filter(Domain.flagInactive == 0)
+        .scalar()
+    )
+
+    max_parts = [
+        max_ip_list_update.isoformat() if max_ip_list_update else "-",
+        max_domain_list_update.isoformat() if max_domain_list_update else "-",
+        max_ip_update.isoformat() if max_ip_update else "-",
+        max_domain_update.isoformat() if max_domain_update else "-",
+    ]
+
+    fingerprint = "|".join(
+        [
+            "v1",
+            str(ip_list_count),
+            str(domain_list_count),
+            str(ip_count),
+            str(domain_count),
+            *max_parts,
+        ]
+    )
+
+    meta = {
+        "ipListCount": ip_list_count,
+        "domainListCount": domain_list_count,
+        "ipCount": ip_count,
+        "domainCount": domain_count,
+        "maxIpListUpdate": max_parts[0],
+        "maxDomainListUpdate": max_parts[1],
+        "maxIpUpdate": max_parts[2],
+        "maxDomainUpdate": max_parts[3],
+    }
+    return fingerprint, meta
+
+
 # ---------------------------------------------------------------------------
 # CIDR consolidation
 # ---------------------------------------------------------------------------
@@ -84,6 +193,7 @@ TYPE_TO_LIST_NAME = {
     IpList.TYPE_OUTBOUND_DENY: "ip-outbound-deny-dynamic",
     IpList.TYPE_ALL_DENY: "ip-all-deny-dynamic",
 }
+LIST_NAME_TO_TYPE = {v: k for k, v in TYPE_TO_LIST_NAME.items()}
 IGNORED_HOST_ADDRESSES = {
     ipaddress.IPv4Address("0.0.0.0"),
     ipaddress.IPv4Address("255.255.255.255"),
@@ -279,6 +389,22 @@ def _build_datasets(on_list_done=None) -> dict[int, list[tuple[str, int]]]:
 def _sha256_of(entries: list[tuple[str, int]]) -> str:
     joined = "\n".join(sorted(f"{cidr}:{ttl}" for cidr, ttl in entries))
     return hashlib.sha256(joined.encode()).hexdigest()
+
+
+def _build_datasets_from_state_rows(
+    rows: list[FirewallAddressState],
+) -> dict[int, list[tuple[str, int]]]:
+    """Reconstruct collapsed datasets from persisted per-entry firewall state."""
+
+    datasets: dict[int, list[tuple[str, int]]] = {
+        code: [] for code, _label in IpList.TYPE_OPTIONS
+    }
+    for row in rows:
+        list_type = LIST_NAME_TO_TYPE.get(row.listName)
+        if list_type is None:
+            continue
+        datasets[list_type].append((row.ipAddress, _normalize_ttl(row.ttlDays)))
+    return datasets
 
 
 def _routeros_address_literal(cidr: str) -> str:
@@ -1167,6 +1293,66 @@ def apply_firewall(
             },
         )
 
+        source_fingerprint, source_meta = _compute_source_fingerprint(db)
+        cached_source_fingerprint = _read_config_value(
+            db,
+            _source_fingerprint_config_key(firewall_id),
+        )
+        existing_state_count_all = (
+            db.query(FirewallAddressState.id)
+            .filter(
+                FirewallAddressState.firewallsId == firewall_id,
+                FirewallAddressState.flagInactive == 0,
+            )
+            .count()
+        )
+        managed_count = _get_router_managed_entry_count(fw)
+        cached_source_unchanged = (
+            cached_source_fingerprint
+            and cached_source_fingerprint == source_fingerprint
+        )
+        state_rows_all: list[FirewallAddressState] = []
+        if cached_source_unchanged and existing_state_count_all > 0:
+            state_rows_all = (
+                db.query(FirewallAddressState)
+                .filter(
+                    FirewallAddressState.firewallsId == firewall_id,
+                    FirewallAddressState.flagInactive == 0,
+                )
+                .all()
+            )
+        if (
+            not force
+            and cached_source_unchanged
+            and existing_state_count_all > 0
+            and (managed_count or 0) > 0
+        ):
+            now_utc = datetime.now(timezone.utc)
+            _update_history(
+                db,
+                record_id,
+                status="skipped",
+                completedAt=now_utc,
+                errorMessage="source unchanged; skipped collapse/apply",
+            )
+            _update_apply_status(
+                firewall_id,
+                active=False,
+                status="skipped",
+                finishedAt=now_utc.isoformat(),
+                lastError="source unchanged; skipped collapse",
+            )
+            log.info(
+                "Skip collapse/apply due to unchanged source fingerprint",
+                extra={
+                    "firewallsId": firewall_id,
+                    "routerManagedCount": managed_count,
+                    "stateRows": existing_state_count_all,
+                    **source_meta,
+                },
+            )
+            return
+
         _update_history(db, record_id, status="generating")
         _update_apply_status(
             firewall_id,
@@ -1177,23 +1363,41 @@ def apply_firewall(
             processedBuckets=0,
             totalBuckets=0,
         )
-        datasets = get_combined_entries(
-            on_list_done=lambda done, total: _update_apply_status(
-                firewall_id, processedLists=done, totalLists=total
-            ),
-            on_collapse_started=lambda total: _update_apply_status(
+        if cached_source_unchanged and state_rows_all:
+            datasets = _build_datasets_from_state_rows(state_rows_all)
+            _update_apply_status(
                 firewall_id,
-                status="collapsing",
+                processedLists=0,
+                totalLists=0,
                 processedBuckets=0,
-                totalBuckets=total,
-            ),
-            on_collapse_done=lambda done, total: _update_apply_status(
-                firewall_id,
-                status="collapsing",
-                processedBuckets=done,
-                totalBuckets=total,
-            ),
-        )
+                totalBuckets=0,
+                routerFeedback="using cached collapsed state",
+            )
+            log.info(
+                "Using cached collapsed state rows; skipping collapse phase",
+                extra={
+                    "firewallsId": firewall_id,
+                    "stateRows": len(state_rows_all),
+                },
+            )
+        else:
+            datasets = get_combined_entries(
+                on_list_done=lambda done, total: _update_apply_status(
+                    firewall_id, processedLists=done, totalLists=total
+                ),
+                on_collapse_started=lambda total: _update_apply_status(
+                    firewall_id,
+                    status="collapsing",
+                    processedBuckets=0,
+                    totalBuckets=total,
+                ),
+                on_collapse_done=lambda done, total: _update_apply_status(
+                    firewall_id,
+                    status="collapsing",
+                    processedBuckets=done,
+                    totalBuckets=total,
+                ),
+            )
         allow_entries = datasets.get(IpList.TYPE_ALLOW, [])
         other_entries = []
         for code, _label in IpList.TYPE_OPTIONS:
@@ -1229,14 +1433,17 @@ def apply_firewall(
             )
             .count()
         )
-
-        managed_count = _get_router_managed_entry_count(fw)
         if existing_list_state_count == 0 and existing_state_count_all > 0 and (managed_count or 0) > 0:
             _update_list_state_hashes(
                 db,
                 firewall_id=firewall_id,
                 desired_by_list=desired_by_list,
                 now=now_utc,
+            )
+            _write_config_value(
+                db,
+                _source_fingerprint_config_key(firewall_id),
+                source_fingerprint,
             )
             _update_history(
                 db,
@@ -1374,6 +1581,11 @@ def apply_firewall(
                 .first()
             )
             if last and last.whitelistHash == wl_hash and last.blacklistHash == bl_hash:
+                _write_config_value(
+                    db,
+                    _source_fingerprint_config_key(firewall_id),
+                    source_fingerprint,
+                )
                 log.info(
                     "Address lists unchanged; skipping apply",
                     extra={"firewallsId": firewall_id},
@@ -1471,6 +1683,11 @@ def apply_firewall(
                 firewall_id=firewall_id,
                 desired_by_list=desired_by_list_for_apply,
                 now=now_utc,
+            )
+            _write_config_value(
+                db,
+                _source_fingerprint_config_key(firewall_id),
+                source_fingerprint,
             )
             _update_history(
                 db,
