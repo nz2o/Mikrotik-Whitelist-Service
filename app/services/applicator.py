@@ -49,6 +49,7 @@ CHUNK_SIZE = 30  # reduced for faster RouterOS execution; prioritize latency ove
 MAX_CHUNK_BYTES = 2000  # keep chunks small for better RouterOS responsiveness
 TTL_REFRESH_THRESHOLD_DAYS = 4
 MAX_DELETE_OPS_PER_APPLY = 300
+MAX_REFRESH_OPS_PER_MAINTENANCE_APPLY = 500
 CHUNK_WARN_THRESHOLD_SECONDS = 30  # log warning if chunk execution exceeds this
 _APPLY_STATUS_LOCK = threading.Lock()
 _APPLY_STATUS: dict[int, dict[str, object]] = {}
@@ -475,7 +476,15 @@ def _plan_delta_units(
     desired_by_list: dict[str, dict[str, int]],
     generation_tag: str,
     now: datetime,
-) -> tuple[list[list[str]], dict[tuple[str, str], tuple[int, int | None]], set[int], int]:
+    include_refresh: bool,
+    refresh_cap: int,
+) -> tuple[
+    list[list[str]],
+    dict[tuple[str, str], tuple[int, int | None]],
+    set[int],
+    int,
+    int,
+]:
     """Plan incremental RouterOS operations and DB state changes.
 
     Returns:
@@ -494,6 +503,7 @@ def _plan_delta_units(
     delete_units: list[list[str]] = []
     upserts: dict[tuple[str, str], tuple[int, int | None]] = {}
     delete_candidates: list[tuple[tuple[str, str], int]] = []
+    refresh_candidates: list[tuple[float, str, str, int, FirewallAddressState]] = []
 
     # Identify entries no longer desired; removals are throttled per apply.
     for key, row in existing_by_key.items():
@@ -505,43 +515,64 @@ def _plan_delta_units(
         for addr, ttl_days in by_addr.items():
             key = (list_name, addr)
             row = existing_by_key.get(key)
-            needs_refresh = False
             if row is None:
-                needs_refresh = True
-            else:
-                if row.ttlDays != ttl_days:
-                    needs_refresh = True
-                elif not row.generationTag or not row.generationTag.startswith("mws:"):
-                    needs_refresh = True
-                elif row.lastPushedAt is None:
-                    needs_refresh = True
-                else:
-                    remaining = _remaining_ttl_days(row.ttlDays, row.lastPushedAt, now)
-                    if remaining < TTL_REFRESH_THRESHOLD_DAYS:
-                        needs_refresh = True
+                # New key: keep the command cheap; ignore duplicate races safely.
+                add_or_refresh_units.append(
+                    [
+                        f':do {{ /ip firewall address-list add list="{list_name}" '
+                        f'address={addr} timeout={ttl_days}d comment="{generation_tag}" }} on-error={{}}'
+                    ]
+                )
+                upserts[key] = (ttl_days, None)
+                continue
 
-            if needs_refresh:
-                if row is None:
-                    # New key: keep the command cheap; ignore duplicate races safely.
-                    add_or_refresh_units.append(
-                        [
-                            f':do {{ /ip firewall address-list add list="{list_name}" '
-                            f'address={addr} timeout={ttl_days}d comment="{generation_tag}" }} on-error={{}}'
-                        ]
-                    )
-                else:
-                    # Existing key needs refresh/repair: remove and re-add deterministically.
-                    add_or_refresh_units.append(
-                        [
-                            f':do {{ /ip firewall address-list add list="{list_name}" '
-                            f'address={addr} timeout={ttl_days}d comment="{generation_tag}" }} '
-                            f'on-error={{ '
-                            f'/ip firewall address-list remove [find where list="{list_name}" and address={addr}]; '
-                            f'/ip firewall address-list add list="{list_name}" address={addr} timeout={ttl_days}d comment="{generation_tag}" '
-                            f'}}'
-                        ]
-                    )
-                upserts[key] = (ttl_days, row.id if row else None)
+            if row.ttlDays != ttl_days:
+                refresh_candidates.append((
+                    -1.0,
+                    list_name,
+                    addr,
+                    ttl_days,
+                    row,
+                ))
+                continue
+
+            if row.lastPushedAt is None:
+                refresh_candidates.append((
+                    -1.0,
+                    list_name,
+                    addr,
+                    ttl_days,
+                    row,
+                ))
+                continue
+
+            remaining = _remaining_ttl_days(row.ttlDays, row.lastPushedAt, now)
+            if remaining < TTL_REFRESH_THRESHOLD_DAYS:
+                refresh_candidates.append((
+                    remaining,
+                    list_name,
+                    addr,
+                    ttl_days,
+                    row,
+                ))
+
+    selected_refreshes: list[tuple[float, str, str, int, FirewallAddressState]] = []
+    if include_refresh and refresh_cap > 0:
+        # Throttle refreshes so RouterOS doesn't get overwhelmed by full-table maintenance.
+        refresh_candidates.sort(key=lambda item: item[0])
+        selected_refreshes = refresh_candidates[:refresh_cap]
+
+    for _priority, list_name, addr, ttl_days, row in selected_refreshes:
+        add_or_refresh_units.append(
+            [
+                f':do {{ /ip firewall address-list set '
+                f'[find where list="{list_name}" and address={addr}] '
+                f'timeout={ttl_days}d comment="{generation_tag}" }} '
+                f'on-error={{ /ip firewall address-list add list="{list_name}" '
+                f'address={addr} timeout={ttl_days}d comment="{generation_tag}" }}'
+            ]
+        )
+        upserts[(list_name, addr)] = (ttl_days, row.id)
 
     delete_ids: set[int] = set()
     for key, row_id in delete_candidates[:MAX_DELETE_OPS_PER_APPLY]:
@@ -554,8 +585,9 @@ def _plan_delta_units(
         delete_ids.add(row_id)
 
     deferred_delete_count = max(0, len(delete_candidates) - len(delete_ids))
+    deferred_refresh_count = max(0, len(refresh_candidates) - len(selected_refreshes))
     units = add_or_refresh_units + delete_units
-    return units, upserts, delete_ids, deferred_delete_count
+    return units, upserts, delete_ids, deferred_delete_count, deferred_refresh_count
 
 
 def _apply_delta_state(
@@ -886,7 +918,7 @@ def _push_chunks(fw: "Firewall", chunks: list[str], on_chunk_done=None) -> None:
             chunk_elapsed = time.monotonic() - chunk_start_time
             err_output = "".join(err_buf).strip() or stderr.read().decode(errors="replace").strip()
             out_output = "".join(out_buf).strip()
-            if chunk_elapsed > 30:
+            if chunk_elapsed > CHUNK_WARN_THRESHOLD_SECONDS:
                 log.warning(
                     "Slow chunk execution",
                     extra={
@@ -1231,36 +1263,32 @@ def apply_firewall(
             return
         
         # Check which lists have actually changed since last push (hash-based).
-        # Skip unchanged lists entirely to save CPU on collapse/push operations.
         changed_lists = _get_changed_lists(db, firewall_id, desired_by_list)
+        maintenance_refresh_mode = False
         if not changed_lists:
+            maintenance_refresh_mode = True
+            desired_by_list_for_apply = desired_by_list
             log.info(
-                "Skipping apply: no lists have changed since last push",
-                extra={"firewallsId": firewall_id},
+                "No list content changes; running bounded refresh maintenance",
+                extra={
+                    "firewallsId": firewall_id,
+                    "refreshCap": MAX_REFRESH_OPS_PER_MAINTENANCE_APPLY,
+                },
             )
-            _update_apply_status(
-                firewall_id,
-                active=False,
-                status="skipped",
-                finishedAt=datetime.now(timezone.utc).isoformat(),
-                lastError="no lists changed since last push",
+        else:
+            desired_by_list_for_apply = {
+                list_name: entries
+                for list_name, entries in desired_by_list.items()
+                if list_name in changed_lists
+            }
+            log.info(
+                "Detected list changes; running add/delete delta path",
+                extra={
+                    "firewallsId": firewall_id,
+                    "changedLists": sorted(changed_lists),
+                    "totalLists": len(desired_by_list),
+                },
             )
-            return
-
-        desired_by_list_for_apply = {
-            list_name: entries
-            for list_name, entries in desired_by_list.items()
-            if list_name in changed_lists
-        }
-        
-        log.info(
-            "Detected list changes; proceeding with push",
-            extra={
-                "firewallsId": firewall_id,
-                "changedLists": sorted(changed_lists),
-                "totalLists": len(desired_by_list),
-            },
-        )
         
         existing_state_rows = (
             db.query(FirewallAddressState)
@@ -1297,11 +1325,21 @@ def apply_firewall(
                 },
             )
 
-        delta_units, delta_upserts, delta_delete_ids, deferred_delete_count = _plan_delta_units(
+        (
+            delta_units,
+            delta_upserts,
+            delta_delete_ids,
+            deferred_delete_count,
+            deferred_refresh_count,
+        ) = _plan_delta_units(
             existing_rows=existing_state_rows,
             desired_by_list=desired_by_list_for_apply,
             generation_tag=generation_tag,
             now=now_utc,
+            include_refresh=maintenance_refresh_mode,
+            refresh_cap=(
+                MAX_REFRESH_OPS_PER_MAINTENANCE_APPLY if maintenance_refresh_mode else 0
+            ),
         )
         all_chunks = _pack_script_units(delta_units)
         if deferred_delete_count:
@@ -1311,6 +1349,16 @@ def apply_firewall(
                     "firewallsId": firewall_id,
                     "deferredDeletes": deferred_delete_count,
                     "deleteCap": MAX_DELETE_OPS_PER_APPLY,
+                },
+            )
+        if deferred_refresh_count:
+            log.info(
+                "Deferred entry refreshes for later maintenance runs",
+                extra={
+                    "firewallsId": firewall_id,
+                    "deferredRefreshes": deferred_refresh_count,
+                    "refreshCap": MAX_REFRESH_OPS_PER_MAINTENANCE_APPLY,
+                    "maintenanceMode": maintenance_refresh_mode,
                 },
             )
 
@@ -1373,6 +1421,7 @@ def apply_firewall(
             currentChunkBytes=0,
             routerFeedback="starting push",
             deferredDeletes=deferred_delete_count,
+            deferredRefreshes=deferred_refresh_count,
             lastError=None,
         )
 
