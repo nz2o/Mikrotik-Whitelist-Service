@@ -13,6 +13,9 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    networks:
+      mikrotik-net:
+        ipv4_address: 172.19.0.2
 
   api:
     build:
@@ -23,14 +26,17 @@ services:
       postgres:
         condition: service_healthy
     command: >
-      sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port ${API_PORT:-8000}"
+      sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
     ports:
-      - "${API_PORT:-8000}:${API_PORT:-8000}"
+      - "8000:8000"
     volumes:
       - rawiplists:/app/data/rawiplists
     env_file: .env
     environment:
       SERVICE_ROLE: api
+    networks:
+      mikrotik-net:
+        ipv4_address: 172.19.0.3
 
   fetcher:
     build:
@@ -46,6 +52,9 @@ services:
     env_file: .env
     environment:
       SERVICE_ROLE: fetcher
+    networks:
+      mikrotik-net:
+        ipv4_address: 172.19.0.5
 
   applicator:
     build:
@@ -61,7 +70,18 @@ services:
     env_file: .env
     environment:
       SERVICE_ROLE: applicator
+    networks:
+      mikrotik-net:
+        ipv4_address: 172.19.0.4
 
 volumes:
   postgres_data:
   rawiplists:
+
+networks:
+  mikrotik-net:
+    driver: bridge
+      ipam:
+        config:
+          - subnet: 172.19.0.0/16 # Define your subnet - or exclude this for DNS-based.
+            gateway: 172.19.0.1 # Define your gateway - or exclude this for DNS-based.
