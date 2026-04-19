@@ -81,7 +81,7 @@ volumes:
 networks:
   mikrotik-net:
     driver: bridge
-      ipam:
-        config:
-          - subnet: 172.19.0.0/16 # Define your subnet - or exclude this for DNS-based.
-            gateway: 172.19.0.1 # Define your gateway - or exclude this for DNS-based.
+    ipam:
+      config:
+        - subnet: 172.19.0.0/16 # Define your subnet - or exclude this for DNS-based.
+          gateway: 172.19.0.1 # Define your gateway - or exclude this for DNS-based.
