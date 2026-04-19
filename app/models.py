@@ -363,3 +363,42 @@ class ApplyHistory(_StandardMixin, Base):
     errorMessage = Column(Text, nullable=True)
 
     firewall = relationship("Firewall", back_populates="applyHistory")
+    applyErrors = relationship(
+        "ApplyError",
+        back_populates="applyHistory",
+        cascade="all, delete-orphan",
+    )
+
+
+# ---------------------------------------------------------------------------
+# applyErrors
+# ---------------------------------------------------------------------------
+
+
+class ApplyError(_StandardMixin, Base):
+    __tablename__ = "applyErrors"
+    __table_args__ = (
+        Index("ix_applyErrors_flagInactive", "flagInactive"),
+        Index("ix_applyErrors_applyHistoryId_occurredAt", "applyHistoryId", "occurredAt"),
+        Index("ix_applyErrors_firewallsId_occurredAt", "firewallsId", "occurredAt"),
+        {"schema": SCHEMA},
+    )
+
+    applyHistoryId = Column(
+        BigInteger,
+        ForeignKey(f"{SCHEMA}.applyHistory.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    firewallsId = Column(
+        BigInteger,
+        ForeignKey(f"{SCHEMA}.firewalls.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    chunkIndex = Column(Integer, nullable=True)
+    lineIndex = Column(Integer, nullable=True)
+    commandText = Column(Text, nullable=False)
+    errorMessage = Column(Text, nullable=False)
+    occurredAt = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+
+    applyHistory = relationship("ApplyHistory", back_populates="applyErrors")
+    firewall = relationship("Firewall")

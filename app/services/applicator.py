@@ -28,6 +28,7 @@ from app.config import APPLY_TIMEOUT_SECONDS, FETCH_RETRIES, configure_logging
 from app.crypto import decrypt_secret
 from app.database import SessionLocal
 from app.models import (
+    ApplyError,
     ApplyHistory,
     Configuration,
     Domain,
@@ -933,32 +934,76 @@ def _probe_ssh_port(fw: "Firewall", timeout: float) -> tuple[str | None, str | N
         return None, str(exc)
 
 
-def _push_chunks(fw: "Firewall", chunks: list[str], on_chunk_done=None) -> None:
+def _connect_ssh_client(fw: "Firewall", plaintext_secret: str) -> paramiko.SSHClient:
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(
+            hostname=fw.firewallAddress,
+            port=fw.firewallPort,
+            username=fw.firewallUser,
+            password=plaintext_secret,
+            timeout=APPLY_TIMEOUT_SECONDS,
+            auth_timeout=APPLY_TIMEOUT_SECONDS,
+            banner_timeout=APPLY_TIMEOUT_SECONDS,
+            look_for_keys=False,
+            allow_agent=False,
+        )
+    except paramiko.AuthenticationException:
+        raise _SshAuthError(
+            f"SSH authentication failed for {fw.firewallUser}@"
+            f"{fw.firewallAddress}:{fw.firewallPort} — check username/password"
+        )
+    return client
+
+
+def _exec_routeros_command(
+    client: paramiko.SSHClient,
+    command: str,
+    timeout_seconds: int,
+) -> tuple[str, str]:
+    _stdin, stdout, stderr = client.exec_command(command, timeout=timeout_seconds)
+    deadline = time.monotonic() + timeout_seconds
+    channel = stdout.channel
+    out_buf: list[str] = []
+    err_buf: list[str] = []
+
+    while not channel.exit_status_ready():
+        if channel.recv_ready():
+            out_buf.append(channel.recv(4096).decode(errors="replace"))
+        if channel.recv_stderr_ready():
+            err_buf.append(channel.recv_stderr(4096).decode(errors="replace"))
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"command timed out after {timeout_seconds}s")
+        time.sleep(0.05)
+
+    while channel.recv_ready():
+        out_buf.append(channel.recv(4096).decode(errors="replace"))
+    while channel.recv_stderr_ready():
+        err_buf.append(channel.recv_stderr(4096).decode(errors="replace"))
+
+    exit_code = channel.recv_exit_status()
+    out_output = "".join(out_buf).strip()
+    err_output = "".join(err_buf).strip() or stderr.read().decode(errors="replace").strip()
+    if exit_code != 0:
+        raise RuntimeError(f"RouterOS command failed (exit {exit_code}): {err_output}")
+    return out_output, err_output
+
+
+def _push_chunks(
+    fw: "Firewall",
+    chunks: list[str],
+    on_chunk_done=None,
+    on_item_failed=None,
+) -> int:
     """Connect to firewall via SSH and execute all script chunks."""
     plaintext_secret = decrypt_secret(fw.firewallSecret)
     # APPLY_TIMEOUT_SECONDS can be tuned low for connect/auth behavior, but
     # RouterOS chunk execution may legitimately take longer on large lists.
     chunk_timeout_seconds = max(APPLY_TIMEOUT_SECONDS, 90)  # floor for individual chunk execution
+    failed_items = 0
     try:
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        try:
-            client.connect(
-                hostname=fw.firewallAddress,
-                port=fw.firewallPort,
-                username=fw.firewallUser,
-                password=plaintext_secret,
-                timeout=APPLY_TIMEOUT_SECONDS,
-                auth_timeout=APPLY_TIMEOUT_SECONDS,
-                banner_timeout=APPLY_TIMEOUT_SECONDS,
-                look_for_keys=False,
-                allow_agent=False,
-            )
-        except paramiko.AuthenticationException:
-            raise _SshAuthError(
-                f"SSH authentication failed for {fw.firewallUser}@"
-                f"{fw.firewallAddress}:{fw.firewallPort} — check username/password"
-            )
+        client = _connect_ssh_client(fw, plaintext_secret)
         total_chunks = len(chunks)
         for idx, chunk in enumerate(chunks, start=1):
             chunk_start_time = time.monotonic()
@@ -989,61 +1034,67 @@ def _push_chunks(fw: "Firewall", chunks: list[str], on_chunk_done=None) -> None:
                 currentChunkBytes=chunk_byte_size,
                 routerFeedback="sending chunk",
             )
-            stdin, stdout, stderr = client.exec_command(chunk, timeout=chunk_timeout_seconds)
-            deadline = time.monotonic() + chunk_timeout_seconds
-            channel = stdout.channel
-            out_buf: list[str] = []
-            err_buf: list[str] = []
-            while not stdout.channel.exit_status_ready():
-                if channel.recv_ready():
-                    data = channel.recv(4096).decode(errors="replace")
-                    if data:
-                        out_buf.append(data)
-                        snippet = data.strip().splitlines()[-1][:220] if data.strip() else ""
-                        if snippet:
-                            _update_apply_status(
-                                fw.id,
-                                routerFeedback=f"stdout: {snippet[:500]}",
+            try:
+                out_output, _err_output = _exec_routeros_command(
+                    client,
+                    chunk,
+                    chunk_timeout_seconds,
+                )
+            except (TimeoutError, RuntimeError) as chunk_exc:
+                log.warning(
+                    "Chunk execution failed; entering per-command fallback",
+                    extra={
+                        "firewallsId": fw.id,
+                        "chunk": idx,
+                        "totalChunks": total_chunks,
+                        "error": str(chunk_exc),
+                        "lineCount": chunk_line_count,
+                    },
+                )
+                # Fallback: execute each command line independently and continue.
+                fallback_client = None
+                try:
+                    fallback_client = _connect_ssh_client(fw, plaintext_secret)
+                    for line_idx, line in enumerate(chunk_lines, start=1):
+                        try:
+                            _exec_routeros_command(
+                                fallback_client,
+                                line,
+                                max(APPLY_TIMEOUT_SECONDS, 20),
                             )
-                            log.info(
-                                "RouterOS stdout",
-                                extra={
-                                    "firewallsId": fw.id,
-                                    "chunk": idx,
-                                    "message": snippet,
-                                },
-                            )
-                if channel.recv_stderr_ready():
-                    data = channel.recv_stderr(4096).decode(errors="replace")
-                    if data:
-                        err_buf.append(data)
-                        snippet = data.strip().splitlines()[-1][:220] if data.strip() else ""
-                        if snippet:
-                            _update_apply_status(
-                                fw.id,
-                                routerFeedback=f"stderr: {snippet[:500]}",
-                            )
+                        except Exception as item_exc:
+                            failed_items += 1
+                            if on_item_failed:
+                                on_item_failed(
+                                    idx,
+                                    line_idx,
+                                    line,
+                                    str(item_exc),
+                                )
                             log.warning(
-                                "RouterOS stderr",
+                                "Command failed in fallback mode",
                                 extra={
                                     "firewallsId": fw.id,
                                     "chunk": idx,
-                                    "message": snippet,
+                                    "line": line_idx,
+                                    "error": str(item_exc),
                                 },
                             )
-                if time.monotonic() > deadline:
-                    raise TimeoutError(
-                        f"RouterOS chunk {idx}/{total_chunks} timed out after {chunk_timeout_seconds}s"
-                    )
-                time.sleep(0.1)
-            while channel.recv_ready():
-                out_buf.append(channel.recv(4096).decode(errors="replace"))
-            while channel.recv_stderr_ready():
-                err_buf.append(channel.recv_stderr(4096).decode(errors="replace"))
-            exit_code = stdout.channel.recv_exit_status()
+                finally:
+                    if fallback_client is not None:
+                        try:
+                            fallback_client.close()
+                        except Exception:
+                            pass
+                _update_apply_status(
+                    fw.id,
+                    routerFeedback=f"fallback completed for chunk {idx}; failed commands so far: {failed_items}",
+                )
+                if on_chunk_done:
+                    on_chunk_done(idx, total_chunks)
+                continue
+
             chunk_elapsed = time.monotonic() - chunk_start_time
-            err_output = "".join(err_buf).strip() or stderr.read().decode(errors="replace").strip()
-            out_output = "".join(out_buf).strip()
             if chunk_elapsed > CHUNK_WARN_THRESHOLD_SECONDS:
                 log.warning(
                     "Slow chunk execution",
@@ -1056,10 +1107,6 @@ def _push_chunks(fw: "Firewall", chunks: list[str], on_chunk_done=None) -> None:
                         "chunkBytes": chunk_byte_size,
                     },
                 )
-            if exit_code != 0:
-                raise RuntimeError(
-                    f"RouterOS command failed (exit {exit_code}): {err_output}"
-                )
             _update_apply_status(
                 fw.id,
                 routerFeedback=(out_output or "ok")[:500],
@@ -1067,6 +1114,7 @@ def _push_chunks(fw: "Firewall", chunks: list[str], on_chunk_done=None) -> None:
             if on_chunk_done:
                 on_chunk_done(idx, total_chunks)
         client.close()
+        return failed_items
     finally:
         # Ensure the plaintext is not held in memory after this point
         del plaintext_secret
@@ -1637,6 +1685,30 @@ def apply_firewall(
             lastError=None,
         )
 
+        failed_command_count = 0
+
+        def _record_apply_error(
+            chunk_index: int,
+            line_index: int | None,
+            command_text: str,
+            error_message: str,
+        ) -> None:
+            nonlocal failed_command_count
+            failed_command_count += 1
+            db.add(
+                ApplyError(
+                    applyHistoryId=record_id,
+                    firewallsId=firewall_id,
+                    chunkIndex=chunk_index,
+                    lineIndex=line_index,
+                    commandText=command_text[:4000],
+                    errorMessage=error_message[:2000],
+                    occurredAt=datetime.now(timezone.utc),
+                    flagInactive=0,
+                )
+            )
+            db.commit()
+
         last_err: str | None = None
         pushed = False
         for attempt in range(1, FETCH_RETRIES + 1):
@@ -1649,6 +1721,7 @@ def apply_firewall(
                         pushChunksDone=done,
                         pushChunksTotal=total,
                     ),
+                    on_item_failed=_record_apply_error,
                 )
                 pushed = True
                 break
@@ -1694,6 +1767,11 @@ def apply_firewall(
                 record_id,
                 status="complete",
                 completedAt=datetime.now(timezone.utc),
+                errorMessage=(
+                    f"completed with {failed_command_count} command errors"
+                    if failed_command_count
+                    else None
+                ),
             )
             _update_apply_status(
                 firewall_id,
@@ -1704,7 +1782,11 @@ def apply_firewall(
                 blacklistCount=len(other_entries),
                 totalRangeCount=total_range_count,
                 totalIpCount=total_ip_count,
-                lastError=None,
+                lastError=(
+                    f"completed with {failed_command_count} command errors"
+                    if failed_command_count
+                    else None
+                ),
             )
             log.info(
                 "Apply complete",
@@ -1714,6 +1796,7 @@ def apply_firewall(
                     "blacklistCount": len(other_entries),
                     "totalRangeCount": total_range_count,
                     "totalIpCount": total_ip_count,
+                    "failedCommands": failed_command_count,
                 },
             )
         else:
