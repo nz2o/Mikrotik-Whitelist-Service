@@ -1,0 +1,122 @@
+{% extends "base.html" %}
+{% block title %}Apply Errors — Mikrotik Whitelist Service{% endblock %}
+{% block content %}
+<div class="d-flex align-items-center justify-content-between mb-3">
+  <h4 class="mb-0"><i class="bi bi-bug me-2"></i>Apply Command Errors</h4>
+</div>
+
+{% if purged %}
+<div class="alert alert-success py-2" role="alert">Purged {{ purged }} entries.</div>
+{% endif %}
+{% if message %}
+<div class="alert alert-warning py-2" role="alert">{{ message }}</div>
+{% endif %}
+
+<div class="card mb-3">
+  <div class="card-body py-3">
+    <form method="get" action="/apply-errors" class="row g-2 align-items-end">
+      <div class="col-md-3">
+        <label class="form-label small mb-1">Firewall</label>
+        <select name="fw_filter" class="form-select form-select-sm">
+          <option value="">All firewalls</option>
+          {% for fw in firewalls %}
+          <option value="{{ fw.id }}" {% if fw_filter == fw.id %}selected{% endif %}>#{{ fw.id }} {{ fw.firewallAddress }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="col-md-4">
+        <label class="form-label small mb-1">Apply Run</label>
+        <select name="apply_filter" class="form-select form-select-sm">
+          <option value="">All apply runs</option>
+          {% for a in applies %}
+          <option value="{{ a.id }}" {% if apply_filter == a.id %}selected{% endif %}>#{{ a.id }} | FW {{ a.firewallsId }} | {{ a.status }} | {{ a.startedAt.strftime('%Y-%m-%d %H:%M:%S') if a.startedAt else '—' }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="col-md-2">
+        <label class="form-label small mb-1">Rows</label>
+        <input type="number" min="50" max="1000" step="50" name="limit" class="form-control form-control-sm" value="{{ limit }}">
+      </div>
+      <div class="col-md-2 form-check mt-4">
+        <input class="form-check-input" type="checkbox" name="only_timeouts" value="1" id="only-timeouts" {% if only_timeouts == 1 %}checked{% endif %}>
+        <label class="form-check-label" for="only-timeouts">Timeouts only</label>
+      </div>
+      <div class="col-md-1 d-flex gap-2">
+        <button type="submit" class="btn btn-sm btn-outline-secondary">Filter</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<form method="post" action="/apply-errors/purge-selected" id="purge-selected-form">
+  <input type="hidden" name="fw_filter" value="{{ fw_filter if fw_filter else '' }}">
+  <input type="hidden" name="apply_filter" value="{{ apply_filter if apply_filter else '' }}">
+  <input type="hidden" name="only_timeouts" value="{{ only_timeouts if only_timeouts else 0 }}">
+  <input type="hidden" name="limit" value="{{ limit }}">
+
+  <div class="d-flex flex-wrap gap-2 mb-2">
+    <button type="submit" class="btn btn-sm btn-outline-danger" onclick="return confirm('Purge selected apply error rows?')">
+      <i class="bi bi-trash me-1"></i>Purge Selected
+    </button>
+  </div>
+
+  <div class="table-responsive">
+    <table class="table table-sm table-hover table-bordered align-middle">
+      <thead class="table-light">
+        <tr>
+          <th style="width:36px"><input type="checkbox" id="toggle-all"></th>
+          <th>ID</th>
+          <th>Occurred</th>
+          <th>Firewall</th>
+          <th>Apply ID</th>
+          <th>Chunk</th>
+          <th>Line</th>
+          <th>Error</th>
+          <th>Command</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for e in apply_errors %}
+      <tr>
+        <td><input type="checkbox" name="error_ids" value="{{ e.id }}" class="row-check"></td>
+        <td class="text-muted small">{{ e.id }}</td>
+        <td class="small">{{ e.occurredAt.strftime('%Y-%m-%d %H:%M:%S') if e.occurredAt else '—' }}</td>
+        <td>{{ e.firewallsId }}</td>
+        <td>{{ e.applyHistoryId }}</td>
+        <td>{{ e.chunkIndex if e.chunkIndex is not none else '—' }}</td>
+        <td>{{ e.lineIndex if e.lineIndex is not none else '—' }}</td>
+        <td class="small text-danger" style="max-width: 360px; white-space: pre-wrap; word-break: break-word;">{{ e.errorMessage }}</td>
+        <td class="small" style="max-width: 560px; white-space: pre-wrap; word-break: break-word;">{{ e.commandText }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="9" class="text-center text-muted py-3">No apply error rows for this filter.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</form>
+
+<form method="post" action="/apply-errors/purge-all" class="mt-3 d-flex gap-2 align-items-center">
+  <input type="hidden" name="fw_filter" value="{{ fw_filter if fw_filter else '' }}">
+  <input type="hidden" name="apply_filter" value="{{ apply_filter if apply_filter else '' }}">
+  <input type="hidden" name="only_timeouts" value="{{ only_timeouts if only_timeouts else 0 }}">
+  <input type="hidden" name="limit" value="{{ limit }}">
+  <input type="hidden" name="filtered_only" value="1">
+  <button type="submit" class="btn btn-sm btn-danger" onclick="return confirm('Purge ALL rows matching the current filter?')">
+    <i class="bi bi-trash3 me-1"></i>Purge All Filtered
+  </button>
+</form>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const toggleAll = document.getElementById('toggle-all');
+if (toggleAll) {
+  toggleAll.addEventListener('change', () => {
+    document.querySelectorAll('.row-check').forEach((cb) => {
+      cb.checked = toggleAll.checked;
+    });
+  });
+}
+</script>
+{% endblock %}

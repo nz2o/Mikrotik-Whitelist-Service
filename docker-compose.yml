@@ -15,7 +15,7 @@ services:
       retries: 10
     networks:
       mikrotik-net:
-        ipv4_address: 172.19.0.2
+        ipv4_address: 172.29.0.2
 
   api:
     build:
@@ -36,7 +36,7 @@ services:
       SERVICE_ROLE: api
     networks:
       mikrotik-net:
-        ipv4_address: 172.19.0.3
+        ipv4_address: 172.29.0.3
 
   fetcher:
     build:
@@ -54,7 +54,7 @@ services:
       SERVICE_ROLE: fetcher
     networks:
       mikrotik-net:
-        ipv4_address: 172.19.0.5
+        ipv4_address: 172.29.0.5
 
   applicator:
     build:
@@ -72,7 +72,7 @@ services:
       SERVICE_ROLE: applicator
     networks:
       mikrotik-net:
-        ipv4_address: 172.19.0.4
+        ipv4_address: 172.29.0.4
 
 volumes:
   postgres_data:
@@ -83,5 +83,5 @@ networks:
     driver: bridge
     ipam:
       config:
-        - subnet: 172.19.0.0/16 # Define your subnet - or exclude this for DNS-based.
-          gateway: 172.19.0.1 # Define your gateway - or exclude this for DNS-based.
+        - subnet: 172.29.0.0/16 # Define your subnet - or exclude this for DNS-based.
+          gateway: 172.29.0.1 # Define your gateway - or exclude this for DNS-based.

@@ -16,6 +16,7 @@ from app.crypto import encrypt_secret
 from app.database import get_db
 from app.services import applicator as applicator_svc
 from app.models import (
+    ApplyError,
     ApplyHistory,
     Configuration,
     Domain,
@@ -73,6 +74,16 @@ def _text_export_response(content: str, filename: str, download: int) -> PlainTe
     if download == 1:
         response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
     return response
+
+
+def _coerce_optional_int(value: str | None) -> int | None:
+    candidate = (value or "").strip()
+    if not candidate:
+        return None
+    try:
+        return int(candidate)
+    except ValueError:
+        return None
 
 
 def _normalize_ipv4_cidr(value: str) -> str:
@@ -1115,6 +1126,129 @@ def delete_firewall(fw_id: int, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 # Status & Logs page
 # ---------------------------------------------------------------------------
+
+
+@router.get("/apply-errors", response_class=HTMLResponse)
+def page_apply_errors(
+    request: Request,
+    fw_filter: int = None,
+    apply_filter: int = None,
+    only_timeouts: int = 0,
+    limit: int = 200,
+    db: Session = Depends(get_db),
+):
+    safe_limit = max(50, min(limit, 1000))
+    q = db.query(ApplyError).order_by(ApplyError.occurredAt.desc())
+    if fw_filter:
+        q = q.filter(ApplyError.firewallsId == fw_filter)
+    if apply_filter:
+        q = q.filter(ApplyError.applyHistoryId == apply_filter)
+    if only_timeouts == 1:
+        q = q.filter(ApplyError.errorMessage.ilike("%timed out%"))
+
+    apply_errors = q.limit(safe_limit).all()
+    firewalls = db.query(Firewall.id, Firewall.firewallAddress).order_by(Firewall.id).all()
+    applies = (
+        db.query(ApplyHistory.id, ApplyHistory.firewallsId, ApplyHistory.startedAt, ApplyHistory.status)
+        .order_by(ApplyHistory.startedAt.desc())
+        .limit(500)
+        .all()
+    )
+
+    return templates.TemplateResponse(
+        request,
+        "apply_errors.html",
+        {
+            "apply_errors": apply_errors,
+            "firewalls": firewalls,
+            "applies": applies,
+            "fw_filter": fw_filter,
+            "apply_filter": apply_filter,
+            "only_timeouts": only_timeouts,
+            "limit": safe_limit,
+            "purged": request.query_params.get("purged"),
+            "message": request.query_params.get("message"),
+        },
+    )
+
+
+@router.post("/apply-errors/purge-selected")
+def purge_apply_errors_selected(
+    error_ids: list[int] = Form(default=[]),
+    fw_filter: str = Form(""),
+    apply_filter: str = Form(""),
+    only_timeouts: str = Form("0"),
+    limit: str = Form("200"),
+    db: Session = Depends(get_db),
+):
+    params: dict[str, str] = {}
+    if fw_filter.strip():
+        params["fw_filter"] = fw_filter.strip()
+    if apply_filter.strip():
+        params["apply_filter"] = apply_filter.strip()
+    if only_timeouts.strip() == "1":
+        params["only_timeouts"] = "1"
+    if limit.strip():
+        params["limit"] = limit.strip()
+
+    if not error_ids:
+        params["message"] = "No rows selected"
+        target = "/apply-errors"
+        if params:
+            target = f"{target}?{urlencode(params)}"
+        return RedirectResponse(target, status_code=303)
+
+    deleted = (
+        db.query(ApplyError)
+        .filter(ApplyError.id.in_(error_ids))
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+
+    params["purged"] = str(deleted)
+    target = f"/apply-errors?{urlencode(params)}"
+    return RedirectResponse(target, status_code=303)
+
+
+@router.post("/apply-errors/purge-all")
+def purge_apply_errors_all(
+    fw_filter: str = Form(""),
+    apply_filter: str = Form(""),
+    only_timeouts: str = Form("0"),
+    limit: str = Form("200"),
+    filtered_only: str = Form("1"),
+    db: Session = Depends(get_db),
+):
+    fw_id = _coerce_optional_int(fw_filter)
+    apply_id = _coerce_optional_int(apply_filter)
+    timeout_only = only_timeouts.strip() == "1"
+
+    q = db.query(ApplyError)
+    if filtered_only == "1":
+        if fw_id:
+            q = q.filter(ApplyError.firewallsId == fw_id)
+        if apply_id:
+            q = q.filter(ApplyError.applyHistoryId == apply_id)
+        if timeout_only:
+            q = q.filter(ApplyError.errorMessage.ilike("%timed out%"))
+
+    deleted = q.delete(synchronize_session=False)
+    db.commit()
+
+    params: dict[str, str] = {
+        "purged": str(deleted),
+    }
+    if filtered_only == "1":
+        if fw_id:
+            params["fw_filter"] = str(fw_id)
+        if apply_id:
+            params["apply_filter"] = str(apply_id)
+        if timeout_only:
+            params["only_timeouts"] = "1"
+        if limit.strip():
+            params["limit"] = limit.strip()
+
+    return RedirectResponse(f"/apply-errors?{urlencode(params)}", status_code=303)
 
 
 @router.get("/status", response_class=HTMLResponse)
